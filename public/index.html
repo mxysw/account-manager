@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>账号管理系统</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="logo">A</span>
+          <div>
+            <h1>账号管理系统</h1>
+            <p>导入 · 持久化 · 状态检测 · 批量操作（本地自托管）</p>
+          </div>
+        </div>
+        <div class="topbar-stats">
+          <div class="stat"><span id="statTotal">0</span><label>账号</label></div>
+          <div class="stat bad"><span id="statBanned">0</span><label>异常</label></div>
+          <div class="stat"><span id="statSelected">0</span><label>选中</label></div>
+        </div>
+      </header>
+
+      <!-- 顶部 dock：在「检测系统」「养号管理」「废号管理」「登录失败」「出售管理」「已售记录」六个视图间切换（同一单页内 show/hide 各区块）。当前视图记到 localStorage，刷新后停留。 -->
+      <nav class="dock">
+        <button type="button" class="dock-tab" data-view="detect">检测系统</button>
+        <button type="button" class="dock-tab" data-view="nurture">养号管理</button>
+        <button type="button" class="dock-tab" data-view="scrap">废号管理</button>
+        <button type="button" class="dock-tab" data-view="failed">登录失败</button>
+        <button type="button" class="dock-tab" data-view="needverify">待人工</button>
+        <button type="button" class="dock-tab" data-view="tfaerror">密钥错误</button>
+        <button type="button" class="dock-tab" data-view="sales">出售管理</button>
+        <button type="button" class="dock-tab" data-view="sold">已售记录</button>
+      </nav>
+
+      <!-- ============ 批量操作：本机临时浏览器优先，AdsPower 作为兼容模式保留 ============ -->
+      <!-- 运行针对全局 selected 集合，所以在任何视图勾选账号后都能「对选中账号运行」。 -->
+      <section class="panel collapsible shared-auto">
+        <div class="panel-head">
+          <h2>批量操作（本机浏览器优先）</h2>
+          <button class="ghost slim" data-toggle="autoBox">展开</button>
+        </div>
+        <div id="autoBox" style="display:none">
+          <div class="switch-row mode-row">
+            <label class="switch"><input type="radio" name="runMode" value="local" checked /> 本机临时浏览器（推荐，用完即弃）</label>
+            <label class="switch"><input type="radio" name="runMode" value="adspower" /> AdsPower 兼容模式（暂非开发重点）</label>
+          </div>
+          <div class="auto-grid">
+            <label class="field" id="apiKeyField">
+              <span>AdsPower API Key（可选，本地版可留空）</span>
+              <input id="apiKey" type="password" autocomplete="off" placeholder="保存在本浏览器" />
+            </label>
+            <label class="field">
+              <span id="maxConcurrentLabel">最大并发</span>
+              <input id="maxConcurrent" type="number" min="1" max="20" value="3" />
+            </label>
+          </div>
+          <div class="switch-row">
+            <label class="switch" id="optRandomFp"><input id="randomFp" type="checkbox" checked /> 打开时随机指纹</label>
+            <label class="switch"><input id="clearData" type="checkbox" checked /> 打开/关闭时清空全部数据</label>
+            <label class="switch" id="optProxy"><input id="useProxy" type="checkbox" /> 开启动态住宅代理</label>
+            <label class="switch" id="optLocalProxy" hidden title="本机模式代理仍在规划中：浏览器已预留 --proxy-server 启动参数，后续只需导入代理数据即可启用"><input type="checkbox" disabled /> 代理（规划中，暂不可用）</label>
+            <label class="switch"><input id="keepOpen" type="checkbox" /> 跑完不关闭窗口（保留人工查看）</label>
+          </div>
+          <div id="proxyBox" class="proxy-box" hidden>
+            <div id="proxyPool" class="proxy-pool">
+              <label class="field"><span>按代理标签筛选（只从该标签里随机挑；留空=整个代理池）</span>
+                <div class="env-tools">
+                  <select id="proxyTag" class="search-input slim"><option value="">全部代理（不限标签）</option></select>
+                  <button id="loadTagsBtn" type="button" class="ghost slim">刷新标签</button>
+                  <span class="badge" id="proxyTagBadge">未加载</span>
+                </div>
+              </label>
+            </div>
+            <p class="proxy-hint muted">开窗前从你保存的住宅代理池里随机绑一条（不同会话=不同 IP）；选了标签则只从该标签里挑。想验证出口 IP，勾选「检测代理 IP / 国家」动作即可。</p>
+          </div>
+          <div class="field" id="envField">
+            <span class="env-head">
+              选择要使用的窗口（环境）
+              <span class="env-tools">
+                <input id="envSearch" class="search-input slim" type="search" placeholder="搜索名称/编号/分组" />
+                <button id="loadEnvsBtn" type="button" class="ghost slim">加载窗口</button>
+                <label class="check-inline"><input type="checkbox" id="envSelectAll" /> 全选</label>
+                <span class="badge" id="envBadge">未加载</span>
+              </span>
+            </span>
+            <div id="envList" class="env-list"><span class="muted">正在自动加载窗口…</span></div>
+          </div>
+          <div class="field" id="localHint" hidden>
+            <p class="proxy-hint muted">本机临时浏览器模式：无需选择 AdsPower 窗口。按上面「最大并发」自动开 N 个一次性 Chrome/Edge，跑完（或停止）即关闭并清理临时数据。代理仍在规划中（见上方占位）。</p>
+          </div>
+          <div class="field">
+            <span>选择要执行的操作（本机模式建议先选“登录账号”，再按顺序选择检测或维护动作）</span>
+            <div id="actionList" class="action-list"></div>
+          </div>
+          <div class="row-actions">
+            <button id="runBtn" type="button" class="primary slim">对选中账号运行</button>
+            <button id="stopBtn" type="button" class="danger slim" disabled>停止并关闭窗口</button>
+            <span class="import-status" id="runStatus"></span>
+          </div>
+          <div id="jobBoard" class="job-board"></div>
+          <p class="hint">敏感操作（移除设备 / 换验证器）默认不在批量里，需单独谨慎执行，避免触发风控。</p>
+        </div>
+      </section>
+
+      <!-- ============ 检测系统视图 ============ -->
+      <div id="viewDetect" class="view">
+
+      <section class="panel collapsible">
+        <div class="panel-head">
+          <h2>导入账号</h2>
+          <button class="ghost slim" data-toggle="importBox">收起</button>
+        </div>
+        <div id="importBox">
+          <label class="field">
+            <span>每行一个账号（按 email 去重，已存在的只补全空字段）</span>
+            <textarea id="importText" spellcheck="false" rows="5" placeholder="邮箱|密码|2FA密钥|年份|国家&#10;或：邮箱----密码----辅助邮箱/空----2FA密钥&#10;一行一个"></textarea>
+          </label>
+          <label class="field">
+            <span>货源渠道 / 标签（可选）——填了就写到这批新导入账号上，方便按进货来源筛选</span>
+            <input id="importSource" type="text" autocomplete="off" placeholder="例如：A供应商 / 2026-06批 / TG群" />
+          </label>
+          <div class="row-actions">
+            <button id="importBtn" type="button" class="primary slim">导入到账号库</button>
+            <span class="import-status" id="importStatus"></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel collapsible">
+        <div class="panel-head">
+          <h2>信用卡卡池</h2>
+          <button class="ghost slim" data-toggle="cardBox">展开</button>
+        </div>
+        <div id="cardBox" style="display:none">
+          <label class="field">
+            <span>每行一张卡（按卡号去重）。字段顺序灵活，自动识别卡号 / 有效期 / CVC</span>
+            <textarea id="cardImportText" spellcheck="false" rows="4" placeholder="卡号|有效期(MM/YY)|CVC|持卡人(可选)|邮编(可选)|国家(可选)&#10;或用 ---- 分隔：4242424242424242----12/27----123----John Doe----10001----US&#10;一行一张"></textarea>
+          </label>
+          <div class="row-actions">
+            <button id="cardImportBtn" type="button" class="primary slim">导入到卡池</button>
+            <select id="cardFilter" class="filter-select">
+              <option value="">全部卡</option>
+              <option value="unused">未用</option>
+              <option value="used">已用</option>
+              <option value="failed">失败</option>
+              <option value="disabled">停用</option>
+            </select>
+            <button id="cardDeleteBtn" type="button" class="ghost slim danger">删除选中</button>
+            <span class="import-status" id="cardImportStatus"></span>
+            <span class="badge" id="cardBadge">0 张</span>
+          </div>
+          <div class="table-wrap">
+            <table class="acc-table">
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="cardSelectAll" /></th>
+                  <th>#</th>
+                  <th>卡号</th>
+                  <th>有效期</th>
+                  <th>CVC</th>
+                  <th>持卡人</th>
+                  <th>邮编</th>
+                  <th>国家</th>
+                  <th>状态</th>
+                  <th>占用账号</th>
+                  <th>备注</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="cardRows"></tbody>
+            </table>
+          </div>
+          <p class="hint" id="cardEmptyHint" style="display:none">卡池为空，先在上面导入信用卡。</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>账号库</h2>
+          <div class="list-tools">
+            <input id="search" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注" />
+            <select id="filterStatus" class="filter-select">
+              <option value="">全部</option>
+              <option value="abnormal">仅异常（封禁/被拦）</option>
+              <option value="unchecked">未检测</option>
+            </select>
+            <select id="filterCategory" class="filter-select" title="按「库/分类」筛选；切换后「复制选中」在未勾选时会导出当前库这一组账号">
+              <option value="">全部库</option>
+              <option value="sell">出售</option>
+              <option value="nurture">养号</option>
+              <option value="scrap">废号</option>
+              <option value="none">未分类</option>
+              <option value="unchecked">未检测</option>
+            </select>
+            <button id="classifyBtn" type="button" class="primary slim" title="按状态一键归位到各管理页：封禁→废号 / 登录失败→登录失败 / 待人工→待人工 / 密钥错误→密钥错误 / 可售→出售 / 全绿→养号；未分类/未检测留在检测库。已在各管理页或已售的号不动。不勾选则归位检测库全部号。">一键分类</button>
+            <button id="pushToSalesBtn" type="button" class="primary slim" title="把选中账号（未勾选则默认所有「出售」分类的号）导入到出售管理页：打上 inSales 标记，之后在「出售管理」视图集中处理出库/交付。">导入到出售管理</button>
+            <button id="pushToNurtureBtn" type="button" class="primary slim" title="把选中账号（未勾选则默认所有「养号」分类的号）导入到养号管理页：打上 inNurture 标记。导入后这些号将从检测系统账号库搬走，集中到「养号管理」视图。">导入到养号管理</button>
+            <button id="pushToScrapBtn" type="button" class="primary slim" title="把选中账号（未勾选则默认所有「废号」分类的号）导入到废号管理页：打上 inScrap 标记。导入后这些号将从检测系统账号库搬走，集中到「废号管理」视图。">导入到废号管理</button>
+            <button id="pushToFailedBtn" type="button" class="primary slim" title="把选中账号（未勾选则默认所有登录「失败」的号）导入到登录失败管理页：按登录状态(login==="failed")过滤，打上 inFailed 标记。导入后这些号将从检测系统账号库搬走，集中到「登录失败管理」视图。">导入到登录失败管理</button>
+            <button id="pushToNeedVerifyBtn" type="button" class="primary slim" title="把选中账号（未勾选则默认所有登录「待人工」的号）导入到待人工管理页：按登录状态(login==="need_verify")过滤，打上 inNeedVerify 标记。导入后这些号将从检测系统账号库搬走，集中到「待人工管理」视图。">导入到待人工管理</button>
+            <button id="pushTo2faErrorBtn" type="button" class="primary slim" title="把选中账号（未勾选则默认所有登录「2FA密钥错」的号）导入到密钥错误管理页：按登录状态(login==="2fa_error")过滤，打上 in2faError 标记。导入后这些号将从检测系统账号库搬走，集中到「密钥错误管理」视图。">导入到密钥错误管理</button>
+            <button id="exportBtn" type="button" class="ghost slim" title="复制为：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家">复制选中</button>
+            <button id="resetDetectBtn" type="button" class="ghost slim" title="复原检测显示：把选中（或全部）账号的检测状态（登录/Gmail/YouTube/支付/家庭组/Gemini 等）全部复原成「未检测」，不动邮箱/密码/2FA 等账号资料">复原检测</button>
+            <button id="deleteBtn" type="button" class="ghost slim danger">删除选中</button>
+            <span class="badge" id="rowBadge">0 行</span>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="acc-table">
+            <thead>
+              <tr>
+                <th class="col-check"><input type="checkbox" id="selectAll" /></th>
+                <th>#</th>
+                <th>邮箱 / 密码</th>
+                <th>分类</th>
+                <th>货源渠道</th>
+                <th>销售</th>
+                <th>2FA</th>
+                <th>登录</th>
+                <th>国家</th>
+                <th>语言</th>
+                <th>Gmail</th>
+                <th>YouTube</th>
+                <th>支付</th>
+                <th>家庭组</th>
+                <th>Gemini</th>
+                <th>GPT</th>
+                <th>设备</th>
+                <th>设备清理</th>
+                <th>年龄验证</th>
+                <th>服务限制</th>
+                <th>验证电话</th>
+                <th>备注</th>
+                <th>更新时间</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+        <p class="hint" id="emptyHint" style="display:none">账号库为空，先在上面导入账号。</p>
+      </section>
+
+      </div><!-- /#viewDetect -->
+
+      <!-- ============ 出售管理视图 ============ -->
+      <!-- 只显示已「导入到出售管理」(inSales===true) 的账号；出售相关功能集中在这里。 -->
+      <div id="viewSales" class="view" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>出售管理</h2>
+            <div class="list-tools">
+              <input id="salesSearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
+              <select id="filterSale" class="filter-select" title="按销售状态筛选：默认只看在库（可售），避免把已售的混进来重复卖；切到「已售」可查交付记录">
+                <option value="in_stock">在库（可售）</option>
+                <option value="sold">已售</option>
+                <option value="">全部销售状态</option>
+              </select>
+              <button id="sellExportBtn" type="button" class="primary slim" title="对选中账号：先按交付格式复制到剪贴板，再标记为「已售」并记下时间。已售号不再出现在在库视图，防重复卖。">导出并标记已售</button>
+              <button id="restockBtn" type="button" class="ghost slim" title="把选中的已售账号退回在库（撤销误标）：销售状态回到在库、清空已售时间">退回在库</button>
+              <button id="salesCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家">复制选中</button>
+              <button id="removeFromSalesBtn" type="button" class="ghost slim danger" title="把选中账号移出出售管理（inSales 置 false）：不影响检测状态/销售状态，只是不再出现在本页">移出出售管理</button>
+              <span class="badge" id="saleBadge">可售 0 / 已售 0</span>
+              <span class="badge" id="salesRowBadge">0 行</span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="acc-table">
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="salesSelectAll" /></th>
+                  <th>#</th>
+                  <th>邮箱 / 密码</th>
+                  <th>分类</th>
+                  <th>货源渠道</th>
+                  <th>销售</th>
+                  <th>2FA</th>
+                  <th>登录</th>
+                  <th>国家</th>
+                  <th>语言</th>
+                  <th>Gmail</th>
+                  <th>YouTube</th>
+                  <th>支付</th>
+                  <th>家庭组</th>
+                  <th>Gemini</th>
+                  <th>GPT</th>
+                  <th>设备</th>
+                  <th>设备清理</th>
+                  <th>年龄验证</th>
+                  <th>服务限制</th>
+                  <th>验证电话</th>
+                  <th>备注</th>
+                  <th>更新时间</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="salesRows"></tbody>
+            </table>
+          </div>
+          <p class="hint" id="salesEmptyHint" style="display:none">出售管理为空。请到「检测系统」勾选账号后点「导入到出售管理」推送过来（未勾选时默认推送所有「出售」分类的号）。</p>
+        </section>
+      </div><!-- /#viewSales -->
+
+      <!-- ============ 养号管理视图 ============ -->
+      <!-- 只显示已「导入到养号管理」(inNurture===true) 的账号（move 语义）；养号也可走完整出售流程（出库/退回/复制交付/导入出售管理）。 -->
+      <div id="viewNurture" class="view" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>养号管理</h2>
+            <div class="list-tools">
+              <input id="nurtureSearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
+              <select id="filterNurtureSale" class="filter-select" title="按销售状态筛选：默认只看在库（可售），避免把已售的混进来重复卖；切到「已售」可查交付记录">
+                <option value="in_stock">在库（可售）</option>
+                <option value="sold">已售</option>
+                <option value="">全部销售状态</option>
+              </select>
+              <button id="nurtureSellExportBtn" type="button" class="primary slim" title="对选中账号（未勾选则当前列表）：先按交付格式复制到剪贴板，再标记为「已售」并记下时间。已售号不重复导出，防重复卖。">导出并标记已售</button>
+              <button id="nurtureRestockBtn" type="button" class="ghost slim" title="把选中的已售账号退回在库（撤销误标）：销售状态回到在库、清空已售时间">退回在库</button>
+              <button id="nurtureCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家">复制选中</button>
+              <button id="nurturePushToSalesBtn" type="button" class="ghost slim" title="把选中的养号账号也导入到出售管理页（打 inSales 标记），让它同时出现在出售管理视图">导入到出售管理</button>
+              <button id="removeFromNurtureBtn" type="button" class="ghost slim danger" title="把选中账号移出养号管理（inNurture 置 false）：不影响检测状态/销售状态，移出后会重新出现在检测系统账号库">移出养号管理</button>
+              <span class="badge" id="nurtureBadge">可售 0 / 已售 0</span>
+              <span class="badge" id="nurtureRowBadge">0 行</span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="acc-table">
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="nurtureSelectAll" /></th>
+                  <th>#</th>
+                  <th>邮箱 / 密码</th>
+                  <th>分类</th>
+                  <th>货源渠道</th>
+                  <th>销售</th>
+                  <th>2FA</th>
+                  <th>登录</th>
+                  <th>国家</th>
+                  <th>语言</th>
+                  <th>Gmail</th>
+                  <th>YouTube</th>
+                  <th>支付</th>
+                  <th>家庭组</th>
+                  <th>Gemini</th>
+                  <th>GPT</th>
+                  <th>设备</th>
+                  <th>设备清理</th>
+                  <th>年龄验证</th>
+                  <th>服务限制</th>
+                  <th>验证电话</th>
+                  <th>备注</th>
+                  <th>更新时间</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="nurtureRows"></tbody>
+            </table>
+          </div>
+          <p class="hint" id="nurtureEmptyHint" style="display:none">养号库为空。请到「检测系统」勾选账号（或先点「一键分类」）后点「导入到养号管理」推送过来（未勾选时默认推送所有「养号」分类的号）。</p>
+        </section>
+      </div><!-- /#viewNurture -->
+
+      <!-- ============ 废号管理视图 ============ -->
+      <!-- 只显示已「导入到废号管理」(inScrap===true) 的账号（move 语义）；这里只做收纳/复制/移出，不涉及出售流程。 -->
+      <div id="viewScrap" class="view" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>废号管理</h2>
+            <div class="list-tools">
+              <input id="scrapSearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
+              <button id="scrapCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家（未勾选则复制当前列表）">复制选中</button>
+              <button id="removeFromScrapBtn" type="button" class="ghost slim danger" title="把选中账号移出废号管理（inScrap 置 false）：不影响检测状态/销售状态，移出后会重新出现在检测系统账号库">移出废号管理</button>
+              <span class="badge" id="scrapRowBadge">0 行</span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="acc-table">
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="scrapSelectAll" /></th>
+                  <th>#</th>
+                  <th>邮箱 / 密码</th>
+                  <th>分类</th>
+                  <th>货源渠道</th>
+                  <th>销售</th>
+                  <th>2FA</th>
+                  <th>登录</th>
+                  <th>国家</th>
+                  <th>语言</th>
+                  <th>Gmail</th>
+                  <th>YouTube</th>
+                  <th>支付</th>
+                  <th>家庭组</th>
+                  <th>Gemini</th>
+                  <th>GPT</th>
+                  <th>设备</th>
+                  <th>设备清理</th>
+                  <th>年龄验证</th>
+                  <th>服务限制</th>
+                  <th>验证电话</th>
+                  <th>备注</th>
+                  <th>更新时间</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="scrapRows"></tbody>
+            </table>
+          </div>
+          <p class="hint" id="scrapEmptyHint" style="display:none">废号库为空。请到「检测系统」点「一键分类」后，点「导入到废号管理」把废号搬过来（未勾选时默认推送所有「废号」分类的号）。</p>
+        </section>
+      </div><!-- /#viewScrap -->
+
+      <!-- ============ 登录失败管理视图 ============ -->
+      <!-- 只显示已「导入到登录失败管理」(inFailed===true) 的账号（move 语义）；这里只做收纳/复制/移出，不涉及出售流程。 -->
+      <div id="viewFailed" class="view" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>登录失败管理</h2>
+            <div class="list-tools">
+              <input id="failedSearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
+              <button id="failedCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家（未勾选则复制当前列表）">复制选中</button>
+              <button id="removeFromFailedBtn" type="button" class="ghost slim danger" title="把选中账号移出登录失败管理（inFailed 置 false）：不影响检测状态/销售状态，移出后会重新出现在检测系统账号库">移出登录失败管理</button>
+              <span class="badge" id="failedRowBadge">0 行</span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="acc-table">
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="failedSelectAll" /></th>
+                  <th>#</th>
+                  <th>邮箱 / 密码</th>
+                  <th>分类</th>
+                  <th>货源渠道</th>
+                  <th>销售</th>
+                  <th>2FA</th>
+                  <th>登录</th>
+                  <th>国家</th>
+                  <th>语言</th>
+                  <th>Gmail</th>
+                  <th>YouTube</th>
+                  <th>支付</th>
+                  <th>家庭组</th>
+                  <th>Gemini</th>
+                  <th>GPT</th>
+                  <th>设备</th>
+                  <th>设备清理</th>
+                  <th>年龄验证</th>
+                  <th>服务限制</th>
+                  <th>验证电话</th>
+                  <th>备注</th>
+                  <th>更新时间</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="failedRows"></tbody>
+            </table>
+          </div>
+          <p class="hint" id="failedEmptyHint" style="display:none">登录失败库为空。请到「检测系统」勾选登录失败的号或直接点「导入到登录失败管理」搬过来（未勾选时默认推送所有登录「失败」的号）。</p>
+        </section>
+      </div><!-- /#viewFailed -->
+
+      <!-- ============ 待人工管理视图 ============ -->
+      <!-- 只显示已「导入到待人工管理」(inNeedVerify===true) 的账号（move 语义）；这里只做收纳/复制/移出，不涉及出售流程。 -->
+      <div id="viewNeedVerify" class="view" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>待人工管理</h2>
+            <div class="list-tools">
+              <input id="needVerifySearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
+              <button id="needVerifyCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家（未勾选则复制当前列表）">复制选中</button>
+              <button id="removeFromNeedVerifyBtn" type="button" class="ghost slim danger" title="把选中账号移出待人工管理（inNeedVerify 置 false）：不影响检测状态/销售状态，移出后会重新出现在检测系统账号库">移出待人工管理</button>
+              <span class="badge" id="needVerifyRowBadge">0 行</span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="acc-table">
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="needVerifySelectAll" /></th>
+                  <th>#</th>
+                  <th>邮箱 / 密码</th>
+                  <th>分类</th>
+                  <th>货源渠道</th>
+                  <th>销售</th>
+                  <th>2FA</th>
+                  <th>登录</th>
+                  <th>国家</th>
+                  <th>语言</th>
+                  <th>Gmail</th>
+                  <th>YouTube</th>
+                  <th>支付</th>
+                  <th>家庭组</th>
+                  <th>Gemini</th>
+                  <th>GPT</th>
+                  <th>设备</th>
+                  <th>设备清理</th>
+                  <th>年龄验证</th>
+                  <th>服务限制</th>
+                  <th>验证电话</th>
+                  <th>备注</th>
+                  <th>更新时间</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="needVerifyRows"></tbody>
+            </table>
+          </div>
+          <p class="hint" id="needVerifyEmptyHint" style="display:none">待人工库为空。请到「检测系统」勾选待人工的号或直接点「导入到待人工管理」搬过来（未勾选时默认推送所有登录「待人工」的号）。</p>
+        </section>
+      </div><!-- /#viewNeedVerify -->
+
+      <!-- ============ 密钥错误管理视图 ============ -->
+      <!-- 只显示已「导入到密钥错误管理」(in2faError===true) 的账号（move 语义）；这里只做收纳/复制/移出，不涉及出售流程。 -->
+      <div id="view2faError" class="view" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>密钥错误管理</h2>
+            <div class="list-tools">
+              <input id="tfaErrorSearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
+              <button id="tfaErrorCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家（未勾选则复制当前列表）">复制选中</button>
+              <button id="removeFrom2faErrorBtn" type="button" class="ghost slim danger" title="把选中账号移出密钥错误管理（in2faError 置 false）：不影响检测状态/销售状态，移出后会重新出现在检测系统账号库">移出密钥错误管理</button>
+              <span class="badge" id="tfaErrorRowBadge">0 行</span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="acc-table">
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="tfaErrorSelectAll" /></th>
+                  <th>#</th>
+                  <th>邮箱 / 密码</th>
+                  <th>分类</th>
+                  <th>货源渠道</th>
+                  <th>销售</th>
+                  <th>2FA</th>
+                  <th>登录</th>
+                  <th>国家</th>
+                  <th>语言</th>
+                  <th>Gmail</th>
+                  <th>YouTube</th>
+                  <th>支付</th>
+                  <th>家庭组</th>
+                  <th>Gemini</th>
+                  <th>GPT</th>
+                  <th>设备</th>
+                  <th>设备清理</th>
+                  <th>年龄验证</th>
+                  <th>服务限制</th>
+                  <th>验证电话</th>
+                  <th>备注</th>
+                  <th>更新时间</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="tfaErrorRows"></tbody>
+            </table>
+          </div>
+          <p class="hint" id="tfaErrorEmptyHint" style="display:none">密钥错误库为空。请到「检测系统」勾选密钥错误的号或直接点「导入到密钥错误管理」搬过来（未勾选时默认推送所有登录「2FA密钥错」的号）。</p>
+        </section>
+      </div><!-- /#view2faError -->
+
+      <!-- ============ 已售记录视图 ============ -->
+      <!-- 全局销售状态视图：集中显示所有已售号(saleOf==="sold")，不限 bucket（inSales/inNurture/inScrap/inFailed 或都没有）。
+           已售号统一从检测系统账号库隐藏，集中到这里；退回在库后撤销已售（若不属于任何 bucket 会重新出现在检测库）。 -->
+      <div id="viewSold" class="view" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>已售记录</h2>
+            <div class="list-tools">
+              <input id="soldSearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
+              <button id="soldCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家（未勾选则复制当前列表）">复制选中</button>
+              <button id="soldRestockBtn" type="button" class="ghost slim" title="把选中的已售账号退回在库（撤销已售）：销售状态回到在库、清空已售时间，离开已售记录页">退回在库</button>
+              <span class="badge" id="soldBadge">已售 0</span>
+              <span class="badge" id="soldRowBadge">0 行</span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="acc-table">
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="soldSelectAll" /></th>
+                  <th>#</th>
+                  <th>邮箱 / 密码</th>
+                  <th>分类</th>
+                  <th>货源渠道</th>
+                  <th>销售</th>
+                  <th>2FA</th>
+                  <th>登录</th>
+                  <th>国家</th>
+                  <th>语言</th>
+                  <th>Gmail</th>
+                  <th>YouTube</th>
+                  <th>支付</th>
+                  <th>家庭组</th>
+                  <th>Gemini</th>
+                  <th>GPT</th>
+                  <th>设备</th>
+                  <th>设备清理</th>
+                  <th>年龄验证</th>
+                  <th>服务限制</th>
+                  <th>验证电话</th>
+                  <th>备注</th>
+                  <th>更新时间</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="soldRows"></tbody>
+            </table>
+          </div>
+          <p class="hint" id="soldEmptyHint" style="display:none">还没有已售记录。在任意页点账号的「出库」或「导出并标记已售」后，会出现在这里。</p>
+        </section>
+      </div><!-- /#viewSold -->
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>

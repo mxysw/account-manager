@@ -1,0 +1,21 @@
+{
+  "name": "account-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "本地优先的 Google 账号管理与本机 Chrome/Edge 自动化工具",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node test/run.js"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "optionalDependencies": {
+    "puppeteer-core": "25.1.0"
+  },
+  "dependencies": {
+    "adspower-browser": "^2.0.6"
+  }
+}

@@ -1,0 +1,35 @@
+# Dependencies and runtime output
+node_modules/
+*.tmp
+*.log
+npm-debug.log*
+
+# Local account data and secrets
+data/*.json
+data/*.bak
+data/*.backup
+
+# Real browser captures and local debugging artifacts
+tools/_realdump/
+_tmp_*
+*.har
+*.trace
+
+# Local Codex/agent configuration
+.agents/
+skills-lock.json
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local backups and archives
+backups/
+*.zip
+*.tar
+*.tar.gz
