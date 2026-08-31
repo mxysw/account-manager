@@ -62,6 +62,21 @@ function freePort() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Chrome 冷启动时 /json/version 可能先返回 Browser 字段，稍后才补上真正可连接的
+ * webSocketDebuggerUrl。只有后者存在且格式正确，才代表 CDP 已经可以被 Puppeteer 接管。
+ */
+function isDevtoolsReady(version) {
+  if (!version || typeof version.webSocketDebuggerUrl !== "string") return false;
+  try {
+    const endpoint = new URL(version.webSocketDebuggerUrl);
+    return (endpoint.protocol === "ws:" || endpoint.protocol === "wss:")
+      && endpoint.pathname.startsWith("/devtools/browser/");
+  } catch (_) {
+    return false;
+  }
+}
+
 /** 轮询 /json/version，等调试端口真正可用后返回该响应里的端点信息。 */
 function probeDevtools(port) {
   return new Promise((resolve) => {
@@ -82,7 +97,7 @@ async function waitForDevtools(port, totalMs = 30000) {
   const deadline = Date.now() + totalMs;
   while (Date.now() < deadline) {
     const v = await probeDevtools(port);
-    if (v && (v.webSocketDebuggerUrl || v.Browser)) return v;
+    if (isDevtoolsReady(v)) return v;
     await sleep(300);
   }
   return null;
@@ -195,4 +210,8 @@ async function start(opts = {}) {
   };
 }
 
-module.exports = { start, findExecutable };
+module.exports = {
+  start,
+  findExecutable,
+  helpers: { isDevtoolsReady, waitForDevtools },
+};

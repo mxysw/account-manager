@@ -19,6 +19,7 @@ const changeLanguage = require("./change-language");
 const change2fa = require("./change-2fa");
 const removeDevices = require("./remove-devices");
 const removePhones = require("./remove-phones");
+const addPhone = require("./add-phone");
 const geminiCheck = require("./gemini-fix");
 const ageVerify = require("./age-verify");
 const ageVerifyClose = require("./age-verify-close");
@@ -31,6 +32,13 @@ const REGISTRY = {
     risk: "medium",
     readOnly: true,
     run: login,
+  },
+  "check-password": {
+    label: "仅验证账号密码（密码通过即停止，不进入2FA）",
+    risk: "medium",
+    readOnly: true,
+    exclusive: true,
+    run: login.checkPassword,
   },
   "detect-ban": {
     label: "检测 Gmail / YouTube 封禁",
@@ -80,6 +88,13 @@ const REGISTRY = {
     readOnly: false,
     run: removePhones,
   },
+  "add-2fa-phone": {
+    label: "添加两步验证手机号（从手机号池领取，直接添加，写操作！）",
+    risk: "high",
+    readOnly: false,
+    exclusive: true,
+    run: addPhone,
+  },
   "gemini-check": {
     label: "检测 Gemini（建 Gem，失败=需年龄验证）",
     risk: "medium",
@@ -108,7 +123,7 @@ const REGISTRY = {
 
 function list() {
   return Object.entries(REGISTRY).map(([id, a]) => ({
-    id, label: a.label, risk: a.risk, readOnly: a.readOnly,
+    id, label: a.label, risk: a.risk, readOnly: a.readOnly, exclusive: a.exclusive === true,
   }));
 }
 
@@ -116,4 +131,19 @@ function get(id) {
   return REGISTRY[id] || null;
 }
 
-module.exports = { list, get, REGISTRY };
+function normalizeSelection(ids) {
+  return [...new Set(Array.isArray(ids) ? ids.map(String) : [])];
+}
+
+function validateSelection(ids) {
+  const selected = normalizeSelection(ids);
+  const unknown = selected.find((id) => !REGISTRY[id]);
+  if (unknown) return `未知操作：${unknown}`;
+  const exclusive = selected.find((id) => REGISTRY[id] && REGISTRY[id].exclusive === true);
+  if (exclusive && selected.length !== 1) {
+    return `${REGISTRY[exclusive].label}必须单独运行，不能同时选择其它操作`;
+  }
+  return "";
+}
+
+module.exports = { list, get, normalizeSelection, validateSelection, REGISTRY };

@@ -96,19 +96,28 @@ function toBrowserURL(cdpEndpoint) {
 async function connect(cdpEndpoint) {
   const puppeteer = loadPuppeteer();
   const browserURL = toBrowserURL(cdpEndpoint);
-  const browser = await puppeteer.connect({ browserURL, defaultViewport: null, targetFilter });
-  const page = await browser.newPage();
-  // 兼容动作模块里用到的 Playwright 风格 API。
-  if (typeof page.waitForTimeout !== "function") {
-    page.waitForTimeout = (ms) => new Promise((r) => setTimeout(r, ms));
+  let browser = null;
+  let page = null;
+  try {
+    browser = await puppeteer.connect({ browserURL, defaultViewport: null, targetFilter });
+    page = await browser.newPage();
+    // 兼容动作模块里用到的 Playwright 风格 API。
+    if (typeof page.waitForTimeout !== "function") {
+      page.waitForTimeout = (ms) => new Promise((r) => setTimeout(r, ms));
+    }
+    // 关键修复：对每个 page 统一做 ①自动放行原生 beforeunload/alert 对话框（避免「离开此网站？」卡死 goto）
+    // ②反后台节流（让窗口最小化/被遮挡/失焦时页面仍表现为聚焦+可见+active，不被 Chrome 降频拖慢）。
+    // 一处注册全局生效——
+    //   1) 主操作 page 直接初始化；
+    //   2) 监听 targetcreated，让后续 newPage（如 login 重试新开的干净 page、label 标识页）也自动覆盖到，
+    //      这样所有动作经 connect 拿到的 page 都不会被原生弹窗卡住、也不会被后台节流。
+    await initPage(page);
+  } catch (err) {
+    // 冷启动重试前先清掉半连接，避免同一个 CDP 端点残留多个 Puppeteer 会话。
+    if (page) { try { await page.close(); } catch (_) { /* ignore */ } }
+    if (browser) { try { await browser.disconnect(); } catch (_) { /* ignore */ } }
+    throw err;
   }
-  // 关键修复：对每个 page 统一做 ①自动放行原生 beforeunload/alert 对话框（避免「离开此网站？」卡死 goto）
-  // ②反后台节流（让窗口最小化/被遮挡/失焦时页面仍表现为聚焦+可见+active，不被 Chrome 降频拖慢）。
-  // 一处注册全局生效——
-  //   1) 主操作 page 直接初始化；
-  //   2) 监听 targetcreated，让后续 newPage（如 login 重试新开的干净 page、label 标识页）也自动覆盖到，
-  //      这样所有动作经 connect 拿到的 page 都不会被原生弹窗卡住、也不会被后台节流。
-  await initPage(page);
   browser.on("targetcreated", async (target) => {
     try {
       const t = typeof target.type === "function" ? target.type() : target.type;

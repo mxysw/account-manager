@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const accounts = require("./accounts");
 const cards = require("./cards");
+const phones = require("./phones");
 const cookies = require("./cookies");
 const engine = require("./automation/engine");
 const { AdsPower } = require("./automation/adspower");
@@ -13,7 +14,10 @@ const timeSync = require("./automation/time-sync");
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
 
 function sendJson(res, status, data) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  });
   res.end(JSON.stringify(data, null, 2));
 }
 
@@ -43,7 +47,8 @@ function contentType(file) {
 function serveStatic(res, pathname) {
   const file = path.resolve(PUBLIC_DIR, `.${pathname === "/" ? "/index.html" : pathname}`);
   if (file.startsWith(PUBLIC_DIR) && fs.existsSync(file) && fs.statSync(file).isFile()) {
-    res.writeHead(200, { "content-type": contentType(file) });
+    // 本地研发界面必须在刷新后立即拿到最新脚本/样式，避免服务已更新但页面仍显示旧操作列表。
+    res.writeHead(200, { "content-type": contentType(file), "cache-control": "no-store" });
     fs.createReadStream(file).pipe(res);
     return true;
   }
@@ -266,6 +271,68 @@ const ROUTES = [
     return { status: 200, body: { card } };
   }],
 
+  // ---- 两步验证手机号池 ----
+  ["GET", /^\/api\/phones$/, () => ({
+    status: 200,
+    body: { phones: phones.publicList(), statuses: phones.STATUSES, usageModes: phones.USAGE_MODES },
+  })],
+
+  ["POST", /^\/api\/phones\/import$/, async (req) => {
+    const body = await readBody(req);
+    if (!String(body.text || "").trim()) return { status: 400, body: { error: "请粘贴至少一个带国家码的手机号" } };
+    try {
+      const r = phones.importText(body.text, { usageMode: body.usageMode });
+      return { status: 200, body: { ...r, phones: phones.publicList() } };
+    } catch (err) {
+      return { status: 400, body: { error: err.message } };
+    }
+  }],
+
+  ["POST", /^\/api\/phones\/delete$/, async (req) => {
+    const body = await readBody(req);
+    const ids = Array.isArray(body.ids) ? body.ids : (body.id ? [body.id] : []);
+    if (!ids.length) return { status: 400, body: { error: "请提供要删除的手机号 id" } };
+    const r = phones.remove(ids);
+    if (r.blocked && r.blocked.length) {
+      return { status: 409, body: { error: "占用中、待短信验证码或已使用的号码不能删除；可将进行中的号码显式标记为失败/停用", ...r, phones: phones.publicList() } };
+    }
+    return { status: 200, body: { ...r, phones: phones.publicList() } };
+  }],
+
+  ["POST", /^\/api\/phones\/([^/]+)\/confirm-used$/, async (req, m) => {
+    const body = await readBody(req);
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return { status: 400, body: { error: "请求体必须只包含 accountId" } };
+    }
+    const keys = Object.keys(body);
+    if (keys.some((key) => key !== "accountId")) {
+      return { status: 400, body: { error: "请求体只支持 accountId" } };
+    }
+    const accountId = String(body.accountId || "").trim();
+    if (!accountId) return { status: 400, body: { error: "请提供 accountId" } };
+    const account = accounts.getById(accountId);
+    if (!account) return { status: 404, body: { error: "账号不存在" } };
+    try {
+      const phone = phones.confirmManualUsed(m[1], account);
+      if (!phone) return { status: 404, body: { error: "手机号不存在" } };
+      const updatedAccount = accounts.update(account.id, { status: { phone: "ok" } });
+      return { status: 200, body: { phone: phones.toPublic(phone), account: updatedAccount } };
+    } catch (err) {
+      return { status: err && err.code === "PHONE_STATE_CONFLICT" ? 409 : 400, body: { error: err.message } };
+    }
+  }],
+
+  ["PATCH", /^\/api\/phones\/([^/]+)$/, async (req, m) => {
+    const body = await readBody(req);
+    try {
+      const phone = phones.update(m[1], body);
+      if (!phone) return { status: 404, body: { error: "手机号不存在" } };
+      return { status: 200, body: { phone: phones.toPublic(phone) } };
+    } catch (err) {
+      return { status: err && err.code === "PHONE_STATE_CONFLICT" ? 409 : 400, body: { error: err.message } };
+    }
+  }],
+
   // ---- 自动化 ----
   ["GET", /^\/api\/automation\/actions$/, () => ({ status: 200, body: { actions: engine.listActions() } })],
 
@@ -297,11 +364,13 @@ const ROUTES = [
     const mode = body.mode === "local" ? "local" : "adspower";
     const envSerials = Array.isArray(body.envs) ? body.envs : String(body.envs || "").split(/[\s,，;；]+/).filter(Boolean);
     const accountIds = Array.isArray(body.accountIds) ? body.accountIds : [];
-    const actionIds = Array.isArray(body.actionIds) ? body.actionIds : [];
+    const actionIds = engine.normalizeActionSelection(Array.isArray(body.actionIds) ? body.actionIds : []);
     // 本机临时浏览器模式不需要 AdsPower 环境编号，按并发数自动开 N 个本地窗口。
     if (mode !== "local" && !envSerials.length) return { status: 400, body: { error: "请提供至少一个 AdsPower 环境编号" } };
     if (!accountIds.length) return { status: 400, body: { error: "请选择至少一个账号" } };
     if (!actionIds.length) return { status: 400, body: { error: "请选择至少一个操作" } };
+    const actionError = engine.validateActionSelection(actionIds);
+    if (actionError) return { status: 400, body: { error: actionError } };
 
     // 代理：AdsPower 模式才用代理池 + 标签；本机模式的代理仍在规划中，透传 proxy.server 即可（UI 暂未对接）。
     const proxy = body.proxy || null;
@@ -316,12 +385,18 @@ const ROUTES = [
       }
     }
 
-    const job = engine.createJob({
-      apiKey, mode, envSerials, accountIds, actionIds,
-      maxConcurrent: body.maxConcurrent, targets: body.targets,
-      randomFp: body.randomFp, clearData: body.clearData, keepOpen: body.keepOpen,
-      proxy,
-    });
+    let job;
+    try {
+      job = engine.createJob({
+        apiKey, mode, envSerials, accountIds, actionIds,
+        maxConcurrent: body.maxConcurrent, targets: body.targets,
+        randomFp: body.randomFp, clearData: body.clearData, keepOpen: body.keepOpen,
+        phoneMode: body.phoneMode,
+        proxy,
+      });
+    } catch (err) {
+      return { status: 400, body: { error: err.message } };
+    }
     return { status: 202, body: { jobId: job.id, job: engine.publicJob(job) } };
   }],
 

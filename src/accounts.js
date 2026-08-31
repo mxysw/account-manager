@@ -35,10 +35,36 @@ const STATUS_FIELDS = {
   device: ["unknown", "cleaned", "rejected", "seckey"],
   // 年龄验证：ok=能建 Gem(不需验证/已通过)；needs=建 Gem 失败需年龄验证；verified=信用卡验证已完成；failed=验证失败。
   age: ["unknown", "ok", "needs", "verified", "failed"],
-  // 验证电话（remove-phones 写回）：unknown=未检测；removed=已移除2步验证电话/恢复电话；
-  //   none=本来就没有验证/恢复电话；failed=移除失败/需人工。ok 预留兼容（可不用）。
-  phone: ["unknown", "ok", "removed", "none", "failed"],
+  // 验证电话：ok=已添加（含 Google 提示稍后生效）；pending=已提交、等待确认/生效或条件性短信码；
+  //   removed=已移除2步验证电话/恢复电话；none=本来就没有；failed=添加/移除失败或需人工。
+  phone: ["unknown", "ok", "pending", "removed", "none", "failed"],
 };
+
+// 最近一次“登录账号”动作与“仅检测密码”动作共享的 reasonCode 导出并集。
+// 持久化时必须使用下面两个各自的白名单，避免把“完整登录成功”和“仅密码正确”混为一谈。
+const LAST_LOGIN_REASON_CODES = new Set([
+  "ok",
+  "password_wrong", "password_changed", "credentials_missing",
+  "totp_missing", "totp_invalid", "totp_flow_error",
+  "captcha", "device_prompt", "sms_verification", "security_code", "no_supported_2fa",
+  "risk_verification", "browser_blocked", "browser_start_failed",
+  "account_disabled", "account_not_found",
+  "unknown_challenge", "timeout", "other",
+]);
+
+const LAST_PASSWORD_CHECK_REASON_CODES = new Set([
+  "password_correct",
+  "password_wrong", "password_changed", "credentials_missing",
+  "captcha", "risk_verification", "browser_blocked", "browser_start_failed",
+  "account_disabled", "account_not_found",
+  "unknown_challenge", "timeout", "other",
+]);
+
+// 保持既有模块 API：调用方仍可使用 LOGIN_REASON_CODES 查询两类诊断支持的 reasonCode 并集。
+const LOGIN_REASON_CODES = new Set([
+  ...LAST_LOGIN_REASON_CODES,
+  ...LAST_PASSWORD_CHECK_REASON_CODES,
+]);
 
 // 可直接行内编辑的普通字段。source=货源渠道/进货标签，跟备注一样允许手动改。
 const EDITABLE = new Set([
@@ -117,6 +143,10 @@ function createFrom(parsed) {
     source: "",
     tags: [],
     status: blankStatus(),
+    // { reasonCode, outcome, detail, checkedAt }；登录成功也记录 ok，复原检测/手动改登录状态时清空。
+    lastLoginCheck: null,
+    // “仅检测账号密码”的独立结果；不等同于完整登录成功，避免影响账号分类。
+    lastPasswordCheck: null,
     // 分类「库」：默认未分类，需点「一键分类」按规则算出。
     category: "none",
     // 销售状态：默认在库（可售）；出库交付后置 sold 并记 soldAt，避免重复卖。
@@ -306,6 +336,39 @@ function getById(id) {
   return db.get().accounts.find((a) => a.id === id) || null;
 }
 
+function normalizeLoginCheck(value, kind) {
+  if (!value || typeof value !== "object") return null;
+
+  const isPasswordCheck = kind === "password";
+  const allowed = isPasswordCheck ? LAST_PASSWORD_CHECK_REASON_CODES : LAST_LOGIN_REASON_CODES;
+  const successCode = isPasswordCheck ? "password_correct" : "ok";
+  const rawOutcome = String(value.outcome || "");
+  const outcome = ["ok", "error", "need_verify"].includes(rawOutcome) ? rawOutcome : "error";
+  let reasonCode = allowed.has(String(value.reasonCode || "")) ? String(value.reasonCode) : "other";
+
+  // 成功状态与成功原因必须双向一致，避免出现“密码正确 + 红色错误”或“登录成功 + 失败原因”。
+  if (outcome === "ok") reasonCode = successCode;
+  else if (reasonCode === successCode) reasonCode = "other";
+
+  // 不持久化 URL 查询串（Google TL 等短期令牌），并限制长度，账号库只保留人话诊断。
+  const detail = String(value.detail || "")
+    .replace(/https?:\/\/[^\s，；]+/gi, (raw) => raw.split("?")[0].slice(0, 180))
+    .slice(0, 500);
+  const checkedAt = new Date(value.checkedAt || "");
+  const normalized = {
+    reasonCode,
+    outcome,
+    detail,
+    checkedAt: Number.isNaN(checkedAt.getTime()) ? nowIso() : checkedAt.toISOString(),
+  };
+  if (reasonCode === "password_changed") {
+    const fromDetail = detail.match(/(?:提示[:：]?\s*)?(\d+)\s*天前/);
+    const daysAgo = Math.floor(Number(value.daysAgo != null ? value.daysAgo : (fromDetail && fromDetail[1])));
+    if (Number.isFinite(daysAgo) && daysAgo >= 0 && daysAgo <= 36500) normalized.daysAgo = daysAgo;
+  }
+  return normalized;
+}
+
 /**
  * 导入多行，按 email 去重；已存在的只补全空字段，不覆盖。
  * opts.source：本批货源渠道/标签——写到所有「新导入」账号上；
@@ -331,12 +394,20 @@ function importText(text, opts = {}) {
     const key = parsed.email.toLowerCase();
     const existing = byEmail.get(key);
     if (existing) {
+      const fillsMissingPassword = !existing.password && !!parsed.password;
       existing.password = existing.password || parsed.password;
       existing.totpSecret = existing.totpSecret || parsed.totpSecret;
       existing.recoveryEmail = existing.recoveryEmail || parsed.recoveryEmail;
       existing.year = existing.year || parsed.year;
       existing.country = existing.country || parsed.country;
       if (source && !existing.source) existing.source = source;
+      if (fillsMissingPassword) {
+        // 导入补全了原本缺失的密码，旧的“缺少凭据”等结论已失效；与行内修改密码保持一致。
+        existing.lastPasswordCheck = null;
+        existing.lastLoginCheck = null;
+        if (!existing.status || typeof existing.status !== "object") existing.status = blankStatus();
+        existing.status.login = "unknown";
+      }
       existing.updatedAt = nowIso();
       merged += 1;
     } else {
@@ -354,6 +425,13 @@ function importText(text, opts = {}) {
 function update(id, patch) {
   const account = getById(id);
   if (!account) return null;
+  const previousLoginCheck = account.lastLoginCheck;
+  const loginStatusTouched = !!(patch && patch.status && Object.prototype.hasOwnProperty.call(patch.status, "login"));
+  const loginCheckProvided = !!(patch && Object.prototype.hasOwnProperty.call(patch, "lastLoginCheck"));
+  const passwordTouched = !!(patch && Object.prototype.hasOwnProperty.call(patch, "password"));
+  const passwordChanged = passwordTouched
+    && String(patch.password == null ? "" : patch.password) !== String(account.password == null ? "" : account.password);
+  const passwordCheckProvided = !!(patch && Object.prototype.hasOwnProperty.call(patch, "lastPasswordCheck"));
   for (const [key, value] of Object.entries(patch || {})) {
     if (EDITABLE.has(key)) {
       account[key] = String(value == null ? "" : value);
@@ -371,6 +449,33 @@ function update(id, patch) {
         if (allowed && allowed.includes(sVal)) account.status[sKey] = sVal;
       }
       account.lastCheckedAt = nowIso();
+    } else if (key === "lastLoginCheck") {
+      account.lastLoginCheck = normalizeLoginCheck(value, "login");
+    } else if (key === "lastPasswordCheck") {
+      account.lastPasswordCheck = normalizeLoginCheck(value, "password");
+    }
+  }
+  // 手工只改登录下拉时，旧诊断已不再可信；登录动作会在同一个 patch 里同时提供新的 lastLoginCheck。
+  if (loginStatusTouched && !loginCheckProvided) account.lastLoginCheck = null;
+  // 密码内容发生变化后，所有基于旧凭据得出的结论都立即失效。
+  if (passwordChanged) {
+    account.lastPasswordCheck = null;
+    account.lastLoginCheck = null;
+    if (!account.status || typeof account.status !== "object") account.status = blankStatus();
+    account.status.login = "unknown";
+  } else if (passwordCheckProvided && !loginCheckProvided && account.lastPasswordCheck && previousLoginCheck) {
+    // 新密码检测只推翻与凭据直接矛盾的旧完整登录结论；人机验证、设备提示等非凭据诊断继续保留。
+    const newPasswordCode = account.lastPasswordCheck.reasonCode;
+    const oldCredentialFailure = ["password_wrong", "password_changed", "credentials_missing"]
+      .includes(previousLoginCheck.reasonCode);
+    const newCredentialFailure = ["password_wrong", "password_changed", "credentials_missing"]
+      .includes(newPasswordCode);
+    const contradictsOldLogin = (newPasswordCode === "password_correct" && oldCredentialFailure)
+      || (newCredentialFailure && previousLoginCheck.outcome === "ok");
+    if (contradictsOldLogin) {
+      account.lastLoginCheck = null;
+      if (!account.status || typeof account.status !== "object") account.status = blankStatus();
+      account.status.login = "unknown";
     }
   }
   account.updatedAt = nowIso();
@@ -386,6 +491,8 @@ function resetStatus(ids) {
   for (const account of data.accounts) {
     if (!set.has(account.id)) continue;
     account.status = blankStatus();
+    account.lastLoginCheck = null;
+    account.lastPasswordCheck = null;
     // category 是由检测状态算出来的派生值；全部复原为 unknown 后应回到「未检测」。
     account.category = "unchecked";
     account.lastCheckedAt = "";
@@ -449,6 +556,28 @@ function migrateSaleFields() {
     if (account.oldTotpSecret == null) { account.oldTotpSecret = ""; changed = true; }
     if (account.totpChangeCount == null) { account.totpChangeCount = 0; changed = true; }
     if (account.totpChangedAt == null) { account.totpChangedAt = ""; changed = true; }
+    // 登录失败原因是新字段；老数据没有可靠 detail，保留粗状态并把诊断置空。
+    if (!Object.prototype.hasOwnProperty.call(account, "lastLoginCheck")) {
+      account.lastLoginCheck = null;
+      changed = true;
+    } else {
+      const normalized = normalizeLoginCheck(account.lastLoginCheck, "login");
+      if (JSON.stringify(normalized) !== JSON.stringify(account.lastLoginCheck)) {
+        account.lastLoginCheck = normalized;
+        changed = true;
+      }
+    }
+    // 独立密码检测结果是新字段；老数据默认从未执行过该检测。
+    if (!Object.prototype.hasOwnProperty.call(account, "lastPasswordCheck")) {
+      account.lastPasswordCheck = null;
+      changed = true;
+    } else {
+      const normalized = normalizeLoginCheck(account.lastPasswordCheck, "password");
+      if (JSON.stringify(normalized) !== JSON.stringify(account.lastPasswordCheck)) {
+        account.lastPasswordCheck = normalized;
+        changed = true;
+      }
+    }
     // 状态字段兜底：老数据可能缺新增的检测字段（如 restrict 服务限制），逐个补默认 unknown，
     // 保证前端渲染 / computeCategory 遍历 STATUS_FIELDS 时不出现 undefined。
     if (!account.status || typeof account.status !== "object") { account.status = blankStatus(); changed = true; }
@@ -700,6 +829,7 @@ function removeFrom2faError(ids) {
 
 module.exports = {
   STATUS_FIELDS,
+  LOGIN_REASON_CODES,
   CATEGORIES,
   SALE_STATUSES,
   parseLine,

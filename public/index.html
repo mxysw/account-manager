@@ -35,34 +35,173 @@
         <button type="button" class="dock-tab" data-view="sold">已售记录</button>
       </nav>
 
+      <!-- 检测系统快捷导入：账号在左、信用卡在右；仅检测系统视图显示。 -->
+      <div id="detectQuickTools" class="detect-quick-tools">
+        <section class="panel collapsible import-panel">
+          <div class="panel-head">
+            <h2>导入账号</h2>
+            <button class="ghost slim" data-toggle="importBox">收起</button>
+          </div>
+          <div id="importBox" class="import-box">
+            <label class="field">
+              <span>每行一个账号（按 email 去重，已存在的只补全空字段）</span>
+              <textarea id="importText" spellcheck="false" rows="2" placeholder="邮箱|密码|2FA密钥|年份|国家&#10;或：邮箱----密码----辅助邮箱/空----2FA密钥（一行一个）"></textarea>
+            </label>
+            <div class="import-tools">
+              <label class="field">
+                <span>货源渠道 / 标签（可选）</span>
+                <input id="importSource" type="text" autocomplete="off" placeholder="例如：A供应商 / 2026-06批 / TG群" />
+              </label>
+              <div class="row-actions">
+                <button id="importBtn" type="button" class="primary slim">导入到账号库</button>
+                <span class="import-status" id="importStatus"></span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel collapsible card-pool-panel">
+          <div class="panel-head">
+            <h2>信用卡卡池</h2>
+            <button class="ghost slim" data-toggle="cardBox">展开</button>
+          </div>
+          <div id="cardBox" style="display:none">
+            <label class="field">
+              <span>每行一张卡（按卡号去重）。字段顺序灵活，自动识别卡号 / 有效期 / CVC</span>
+              <textarea id="cardImportText" spellcheck="false" rows="2" placeholder="卡号|有效期(MM/YY)|CVC|持卡人(可选)|邮编(可选)|国家(可选)&#10;或用 ---- 分隔（一行一张）"></textarea>
+            </label>
+            <div class="row-actions">
+              <button id="cardImportBtn" type="button" class="primary slim">导入到卡池</button>
+              <select id="cardFilter" class="filter-select">
+                <option value="">全部卡</option>
+                <option value="unused">未用</option>
+                <option value="used">已用</option>
+                <option value="failed">失败</option>
+                <option value="disabled">停用</option>
+              </select>
+              <button id="cardDeleteBtn" type="button" class="ghost slim danger">删除选中</button>
+              <span class="import-status" id="cardImportStatus"></span>
+              <span class="badge" id="cardBadge">0 张</span>
+            </div>
+            <div id="cardTableWrap" class="table-wrap" hidden>
+              <table class="acc-table">
+                <thead>
+                  <tr>
+                    <th class="col-check"><input type="checkbox" id="cardSelectAll" /></th>
+                    <th>#</th>
+                    <th>卡号</th>
+                    <th>有效期</th>
+                    <th>CVC</th>
+                    <th>持卡人</th>
+                    <th>邮编</th>
+                    <th>国家</th>
+                    <th>状态</th>
+                    <th>占用账号</th>
+                    <th>备注</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="cardRows"></tbody>
+              </table>
+            </div>
+            <p class="hint" id="cardEmptyHint" style="display:none">卡池为空，先在上面导入信用卡。</p>
+          </div>
+        </section>
+
+        <section class="panel collapsible phone-pool-panel">
+          <div class="panel-head">
+            <h2>手机号池</h2>
+            <button class="ghost slim" data-toggle="phoneBox">展开</button>
+          </div>
+          <div id="phoneBox" style="display:none">
+            <label class="field">
+              <span>每行一个国际手机号（必须带国家码），可用 | 在后面附备注。通常会直接添加并提示稍后生效；仅当 Google 另行要求时才需要人工处理验证码。</span>
+              <textarea id="phoneImportText" spellcheck="false" rows="2" placeholder="+12025550123|备用号码（一行一个）"></textarea>
+            </label>
+            <div class="phone-mode-bar">
+              <label class="phone-mode-field">
+                <span>导入为</span>
+                <select id="phoneImportMode" class="filter-select" title="决定这批新号码以后能否分配给多个账号">
+                  <option value="shared" selected>共享号码（可绑多个账号）</option>
+                  <option value="exclusive">一号一绑</option>
+                </select>
+              </label>
+              <label class="phone-mode-field">
+                <span>本次添加使用</span>
+                <select id="phoneRunMode" class="filter-select" title="运行“添加两步验证手机号”时，只从对应模式的号码中领取">
+                  <option value="shared" selected>共享号码</option>
+                  <option value="exclusive">一号一绑</option>
+                </select>
+              </label>
+            </div>
+            <div class="row-actions">
+              <button id="phoneImportBtn" type="button" class="primary slim">导入到手机号池</button>
+              <select id="phoneFilter" class="filter-select">
+                <option value="">全部号码</option>
+                <option value="unused">未用</option>
+                <option value="reserved">已占用</option>
+                <option value="pending">待生效 / 待确认</option>
+                <option value="used">已用</option>
+                <option value="failed">失败</option>
+                <option value="disabled">停用</option>
+              </select>
+              <button id="phoneDeleteBtn" type="button" class="ghost slim danger">删除选中</button>
+              <span class="import-status" id="phoneImportStatus"></span>
+              <span class="badge" id="phoneBadge">0 个</span>
+            </div>
+            <div id="phoneTableWrap" class="table-wrap" hidden>
+              <table class="acc-table phone-table">
+                <thead>
+                  <tr>
+                    <th class="col-check"><input type="checkbox" id="phoneSelectAll" /></th>
+                    <th>#</th>
+                    <th>手机号</th>
+                    <th>模式</th>
+                    <th>状态</th>
+                    <th>已绑</th>
+                    <th>占用账号</th>
+                    <th>备注 / 原因</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="phoneRows"></tbody>
+              </table>
+            </div>
+            <p class="hint" id="phoneEmptyHint" style="display:none">手机号池为空。添加手机号动作会为每个账号原子领取一个未用号码。</p>
+          </div>
+        </section>
+      </div>
+
       <!-- ============ 批量操作：本机临时浏览器优先，AdsPower 作为兼容模式保留 ============ -->
       <!-- 运行针对全局 selected 集合，所以在任何视图勾选账号后都能「对选中账号运行」。 -->
       <section class="panel collapsible shared-auto">
         <div class="panel-head">
           <h2>批量操作（本机浏览器优先）</h2>
-          <button class="ghost slim" data-toggle="autoBox">展开</button>
+          <button class="ghost slim" data-toggle="autoBox" aria-controls="autoBox" aria-expanded="true">收起</button>
         </div>
-        <div id="autoBox" style="display:none">
-          <div class="switch-row mode-row">
-            <label class="switch"><input type="radio" name="runMode" value="local" checked /> 本机临时浏览器（推荐，用完即弃）</label>
-            <label class="switch"><input type="radio" name="runMode" value="adspower" /> AdsPower 兼容模式（暂非开发重点）</label>
-          </div>
-          <div class="auto-grid">
-            <label class="field" id="apiKeyField">
-              <span>AdsPower API Key（可选，本地版可留空）</span>
-              <input id="apiKey" type="password" autocomplete="off" placeholder="保存在本浏览器" />
-            </label>
-            <label class="field">
-              <span id="maxConcurrentLabel">最大并发</span>
-              <input id="maxConcurrent" type="number" min="1" max="20" value="3" />
-            </label>
-          </div>
-          <div class="switch-row">
-            <label class="switch" id="optRandomFp"><input id="randomFp" type="checkbox" checked /> 打开时随机指纹</label>
-            <label class="switch"><input id="clearData" type="checkbox" checked /> 打开/关闭时清空全部数据</label>
-            <label class="switch" id="optProxy"><input id="useProxy" type="checkbox" /> 开启动态住宅代理</label>
-            <label class="switch" id="optLocalProxy" hidden title="本机模式代理仍在规划中：浏览器已预留 --proxy-server 启动参数，后续只需导入代理数据即可启用"><input type="checkbox" disabled /> 代理（规划中，暂不可用）</label>
-            <label class="switch"><input id="keepOpen" type="checkbox" /> 跑完不关闭窗口（保留人工查看）</label>
+        <div id="autoBox" class="batch-box">
+          <div class="batch-toolbar">
+            <div class="switch-row mode-row">
+              <label class="switch"><input type="radio" name="runMode" value="local" checked /> 本机临时浏览器</label>
+              <label class="switch"><input type="radio" name="runMode" value="adspower" /> AdsPower（兼容）</label>
+            </div>
+            <div class="auto-grid">
+              <label class="field" id="apiKeyField">
+                <span>AdsPower API Key</span>
+                <input id="apiKey" type="password" autocomplete="off" placeholder="保存在本浏览器" />
+              </label>
+              <label class="field concurrency-field">
+                <span id="maxConcurrentLabel">并发数</span>
+                <input id="maxConcurrent" type="number" min="1" max="20" value="3" />
+              </label>
+            </div>
+            <div class="switch-row batch-flags">
+              <label class="switch" id="optRandomFp"><input id="randomFp" type="checkbox" checked /> 随机指纹</label>
+              <label class="switch"><input id="clearData" type="checkbox" checked /> 运行前后清空数据</label>
+              <label class="switch" id="optProxy"><input id="useProxy" type="checkbox" /> 动态住宅代理</label>
+              <label class="switch" id="optLocalProxy" hidden><input type="checkbox" disabled /> 代理（规划中）</label>
+              <label class="switch"><input id="keepOpen" type="checkbox" /> 跑完保留窗口</label>
+            </div>
           </div>
           <div id="proxyBox" class="proxy-box" hidden>
             <div id="proxyPool" class="proxy-pool">
@@ -91,93 +230,24 @@
           <div class="field" id="localHint" hidden>
             <p class="proxy-hint muted">本机临时浏览器模式：无需选择 AdsPower 窗口。按上面「最大并发」自动开 N 个一次性 Chrome/Edge，跑完（或停止）即关闭并清理临时数据。代理仍在规划中（见上方占位）。</p>
           </div>
-          <div class="field">
-            <span>选择要执行的操作（本机模式建议先选“登录账号”，再按顺序选择检测或维护动作）</span>
+          <div class="field action-field">
+            <span>选择操作（建议先选“登录账号”）</span>
             <div id="actionList" class="action-list"></div>
           </div>
-          <div class="row-actions">
-            <button id="runBtn" type="button" class="primary slim">对选中账号运行</button>
+          <div class="row-actions batch-run-actions">
+            <button id="runBtn" type="button" class="primary slim" disabled>对选中账号运行</button>
             <button id="stopBtn" type="button" class="danger slim" disabled>停止并关闭窗口</button>
             <span class="import-status" id="runStatus"></span>
+            <span class="batch-risk-note">高风险操作请单独谨慎执行</span>
           </div>
           <div id="jobBoard" class="job-board"></div>
-          <p class="hint">敏感操作（移除设备 / 换验证器）默认不在批量里，需单独谨慎执行，避免触发风控。</p>
         </div>
       </section>
 
       <!-- ============ 检测系统视图 ============ -->
       <div id="viewDetect" class="view">
 
-      <section class="panel collapsible">
-        <div class="panel-head">
-          <h2>导入账号</h2>
-          <button class="ghost slim" data-toggle="importBox">收起</button>
-        </div>
-        <div id="importBox">
-          <label class="field">
-            <span>每行一个账号（按 email 去重，已存在的只补全空字段）</span>
-            <textarea id="importText" spellcheck="false" rows="5" placeholder="邮箱|密码|2FA密钥|年份|国家&#10;或：邮箱----密码----辅助邮箱/空----2FA密钥&#10;一行一个"></textarea>
-          </label>
-          <label class="field">
-            <span>货源渠道 / 标签（可选）——填了就写到这批新导入账号上，方便按进货来源筛选</span>
-            <input id="importSource" type="text" autocomplete="off" placeholder="例如：A供应商 / 2026-06批 / TG群" />
-          </label>
-          <div class="row-actions">
-            <button id="importBtn" type="button" class="primary slim">导入到账号库</button>
-            <span class="import-status" id="importStatus"></span>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel collapsible">
-        <div class="panel-head">
-          <h2>信用卡卡池</h2>
-          <button class="ghost slim" data-toggle="cardBox">展开</button>
-        </div>
-        <div id="cardBox" style="display:none">
-          <label class="field">
-            <span>每行一张卡（按卡号去重）。字段顺序灵活，自动识别卡号 / 有效期 / CVC</span>
-            <textarea id="cardImportText" spellcheck="false" rows="4" placeholder="卡号|有效期(MM/YY)|CVC|持卡人(可选)|邮编(可选)|国家(可选)&#10;或用 ---- 分隔：4242424242424242----12/27----123----John Doe----10001----US&#10;一行一张"></textarea>
-          </label>
-          <div class="row-actions">
-            <button id="cardImportBtn" type="button" class="primary slim">导入到卡池</button>
-            <select id="cardFilter" class="filter-select">
-              <option value="">全部卡</option>
-              <option value="unused">未用</option>
-              <option value="used">已用</option>
-              <option value="failed">失败</option>
-              <option value="disabled">停用</option>
-            </select>
-            <button id="cardDeleteBtn" type="button" class="ghost slim danger">删除选中</button>
-            <span class="import-status" id="cardImportStatus"></span>
-            <span class="badge" id="cardBadge">0 张</span>
-          </div>
-          <div class="table-wrap">
-            <table class="acc-table">
-              <thead>
-                <tr>
-                  <th class="col-check"><input type="checkbox" id="cardSelectAll" /></th>
-                  <th>#</th>
-                  <th>卡号</th>
-                  <th>有效期</th>
-                  <th>CVC</th>
-                  <th>持卡人</th>
-                  <th>邮编</th>
-                  <th>国家</th>
-                  <th>状态</th>
-                  <th>占用账号</th>
-                  <th>备注</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody id="cardRows"></tbody>
-            </table>
-          </div>
-          <p class="hint" id="cardEmptyHint" style="display:none">卡池为空，先在上面导入信用卡。</p>
-        </div>
-      </section>
-
-      <section class="panel">
+      <section class="panel account-library-panel">
         <div class="panel-head">
           <h2>账号库</h2>
           <div class="list-tools">
@@ -202,7 +272,7 @@
             <button id="pushToFailedBtn" type="button" class="primary slim" title="把选中账号（未勾选则默认所有登录「失败」的号）导入到登录失败管理页：按登录状态(login==="failed")过滤，打上 inFailed 标记。导入后这些号将从检测系统账号库搬走，集中到「登录失败管理」视图。">导入到登录失败管理</button>
             <button id="pushToNeedVerifyBtn" type="button" class="primary slim" title="把选中账号（未勾选则默认所有登录「待人工」的号）导入到待人工管理页：按登录状态(login==="need_verify")过滤，打上 inNeedVerify 标记。导入后这些号将从检测系统账号库搬走，集中到「待人工管理」视图。">导入到待人工管理</button>
             <button id="pushTo2faErrorBtn" type="button" class="primary slim" title="把选中账号（未勾选则默认所有登录「2FA密钥错」的号）导入到密钥错误管理页：按登录状态(login==="2fa_error")过滤，打上 in2faError 标记。导入后这些号将从检测系统账号库搬走，集中到「密钥错误管理」视图。">导入到密钥错误管理</button>
-            <button id="exportBtn" type="button" class="ghost slim" title="复制为：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家">复制选中</button>
+            <button id="exportBtn" type="button" class="ghost slim" title="复制为：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家；异常账号末尾追加具体原因，例如----人机验证">复制选中</button>
             <button id="resetDetectBtn" type="button" class="ghost slim" title="复原检测显示：把选中（或全部）账号的检测状态（登录/Gmail/YouTube/支付/家庭组/Gemini 等）全部复原成「未检测」，不动邮箱/密码/2FA 等账号资料">复原检测</button>
             <button id="deleteBtn" type="button" class="ghost slim danger">删除选中</button>
             <span class="badge" id="rowBadge">0 行</span>
@@ -261,7 +331,7 @@
               </select>
               <button id="sellExportBtn" type="button" class="primary slim" title="对选中账号：先按交付格式复制到剪贴板，再标记为「已售」并记下时间。已售号不再出现在在库视图，防重复卖。">导出并标记已售</button>
               <button id="restockBtn" type="button" class="ghost slim" title="把选中的已售账号退回在库（撤销误标）：销售状态回到在库、清空已售时间">退回在库</button>
-              <button id="salesCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家">复制选中</button>
+              <button id="salesCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式；异常账号末尾追加具体原因">复制选中</button>
               <button id="removeFromSalesBtn" type="button" class="ghost slim danger" title="把选中账号移出出售管理（inSales 置 false）：不影响检测状态/销售状态，只是不再出现在本页">移出出售管理</button>
               <span class="badge" id="saleBadge">可售 0 / 已售 0</span>
               <span class="badge" id="salesRowBadge">0 行</span>
@@ -319,7 +389,7 @@
               </select>
               <button id="nurtureSellExportBtn" type="button" class="primary slim" title="对选中账号（未勾选则当前列表）：先按交付格式复制到剪贴板，再标记为「已售」并记下时间。已售号不重复导出，防重复卖。">导出并标记已售</button>
               <button id="nurtureRestockBtn" type="button" class="ghost slim" title="把选中的已售账号退回在库（撤销误标）：销售状态回到在库、清空已售时间">退回在库</button>
-              <button id="nurtureCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家">复制选中</button>
+              <button id="nurtureCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式；异常账号末尾追加具体原因">复制选中</button>
               <button id="nurturePushToSalesBtn" type="button" class="ghost slim" title="把选中的养号账号也导入到出售管理页（打 inSales 标记），让它同时出现在出售管理视图">导入到出售管理</button>
               <button id="removeFromNurtureBtn" type="button" class="ghost slim danger" title="把选中账号移出养号管理（inNurture 置 false）：不影响检测状态/销售状态，移出后会重新出现在检测系统账号库">移出养号管理</button>
               <span class="badge" id="nurtureBadge">可售 0 / 已售 0</span>
@@ -371,7 +441,7 @@
             <h2>废号管理</h2>
             <div class="list-tools">
               <input id="scrapSearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
-              <button id="scrapCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家（未勾选则复制当前列表）">复制选中</button>
+              <button id="scrapCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式；异常账号末尾追加具体原因（未勾选则复制当前列表）">复制选中</button>
               <button id="removeFromScrapBtn" type="button" class="ghost slim danger" title="把选中账号移出废号管理（inScrap 置 false）：不影响检测状态/销售状态，移出后会重新出现在检测系统账号库">移出废号管理</button>
               <span class="badge" id="scrapRowBadge">0 行</span>
             </div>
@@ -421,7 +491,7 @@
             <h2>登录失败管理</h2>
             <div class="list-tools">
               <input id="failedSearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
-              <button id="failedCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家（未勾选则复制当前列表）">复制选中</button>
+              <button id="failedCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式；异常账号末尾追加具体原因（未勾选则复制当前列表）">复制选中</button>
               <button id="removeFromFailedBtn" type="button" class="ghost slim danger" title="把选中账号移出登录失败管理（inFailed 置 false）：不影响检测状态/销售状态，移出后会重新出现在检测系统账号库">移出登录失败管理</button>
               <span class="badge" id="failedRowBadge">0 行</span>
             </div>
@@ -471,7 +541,7 @@
             <h2>待人工管理</h2>
             <div class="list-tools">
               <input id="needVerifySearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
-              <button id="needVerifyCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家（未勾选则复制当前列表）">复制选中</button>
+              <button id="needVerifyCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式；异常账号末尾追加具体原因（未勾选则复制当前列表）">复制选中</button>
               <button id="removeFromNeedVerifyBtn" type="button" class="ghost slim danger" title="把选中账号移出待人工管理（inNeedVerify 置 false）：不影响检测状态/销售状态，移出后会重新出现在检测系统账号库">移出待人工管理</button>
               <span class="badge" id="needVerifyRowBadge">0 行</span>
             </div>
@@ -521,7 +591,7 @@
             <h2>密钥错误管理</h2>
             <div class="list-tools">
               <input id="tfaErrorSearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
-              <button id="tfaErrorCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家（未勾选则复制当前列表）">复制选中</button>
+              <button id="tfaErrorCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式；异常账号末尾追加具体原因（未勾选则复制当前列表）">复制选中</button>
               <button id="removeFrom2faErrorBtn" type="button" class="ghost slim danger" title="把选中账号移出密钥错误管理（in2faError 置 false）：不影响检测状态/销售状态，移出后会重新出现在检测系统账号库">移出密钥错误管理</button>
               <span class="badge" id="tfaErrorRowBadge">0 行</span>
             </div>
@@ -572,7 +642,7 @@
             <h2>已售记录</h2>
             <div class="list-tools">
               <input id="soldSearch" class="search-input" type="search" placeholder="搜索邮箱 / 国家 / 备注 / 货源" />
-              <button id="soldCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家（未勾选则复制当前列表）">复制选中</button>
+              <button id="soldCopyBtn" type="button" class="ghost slim" title="按选中复制交付格式；异常账号末尾追加具体原因（未勾选则复制当前列表）">复制选中</button>
               <button id="soldRestockBtn" type="button" class="ghost slim" title="把选中的已售账号退回在库（撤销已售）：销售状态回到在库、清空已售时间，离开已售记录页">退回在库</button>
               <span class="badge" id="soldBadge">已售 0</span>
               <span class="badge" id="soldRowBadge">0 行</span>

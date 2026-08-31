@@ -4,6 +4,7 @@ const http = require("http");
 const router = require("./router");
 const accounts = require("./accounts");
 const cards = require("./cards");
+const phones = require("./phones");
 const cookies = require("./cookies");
 
 process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", r && r.message ? r.message : r));
@@ -27,6 +28,7 @@ server.listen(PORT, HOST, () => {
 function shutdown() {
   try { accounts.flush(); } catch (_) { /* ignore */ }
   try { cards.flush(); } catch (_) { /* ignore */ }
+  try { phones.flush(); } catch (_) { /* ignore */ }
   try { cookies.flush(); } catch (_) { /* ignore */ }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1000).unref();

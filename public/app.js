@@ -8,12 +8,89 @@ const STATUS_TEXT = {
   on: "已开", off: "未开", blocked: "被拦", cleaned: "已清", rejected: "拒验·人工",
   seckey: "需安全码·人工",
   needs: "待验证", verified: "已验证", failed: "失败",
+  pending: "待生效/验证",
   "2fa_error": "2FA密钥错", need_verify: "待人工",
   locked: "有订阅·难关",
   cf_blocked: "CF验证·人工",
   restricted: "服务受限",
   removed: "已移除", none: "无",
 };
+const LOGIN_REASON_TEXT = {
+  ok: "正常",
+  password_correct: "密码正确",
+  password_wrong: "密码错误",
+  password_changed: "密码已更改",
+  credentials_missing: "账号资料缺失",
+  totp_missing: "缺少2FA密钥",
+  totp_invalid: "2FA密钥错误",
+  totp_flow_error: "2FA验证异常",
+  captcha: "人机验证",
+  device_prompt: "设备通知验证",
+  sms_verification: "短信验证",
+  security_code: "安全代码验证",
+  no_supported_2fa: "无身份验证器",
+  risk_verification: "风控/人工验证",
+  browser_blocked: "浏览器被拦",
+  browser_start_failed: "浏览器启动失败",
+  account_disabled: "账号停用/封禁",
+  account_not_found: "账号不存在",
+  unknown_challenge: "未知验证页",
+  timeout: "登录超时",
+  other: "其他登录错误",
+};
+// 独立密码检测不能复用“登录超时/其他登录错误”等完整登录措辞；它只回答密码是否被接受。
+const PASSWORD_CHECK_REASON_TEXT = {
+  password_correct: "密码正确",
+  password_wrong: "密码错误",
+  password_changed: "密码已更改",
+  credentials_missing: "账号或密码缺失",
+  captcha: "人机验证",
+  risk_verification: "风控·无法确认密码",
+  browser_blocked: "浏览器被拦·无法确认",
+  browser_start_failed: "浏览器启动失败",
+  account_disabled: "账号停用/封禁",
+  account_not_found: "账号不存在",
+  timeout: "密码检测超时",
+  other: "无法确认密码",
+};
+
+function diagnosticDetailText(check) {
+  if (!check || !check.detail) return "";
+  if (typeof check.detail === "string") return check.detail;
+  if (typeof check.detail === "object") return Object.values(check.detail).filter(Boolean).join(" ");
+  return String(check.detail);
+}
+
+function passwordChangedDaysAgo(check) {
+  if (check && check.daysAgo != null) {
+    const explicit = Math.floor(Number(check.daysAgo));
+    if (Number.isFinite(explicit) && explicit >= 0 && explicit <= 36500) return explicit;
+  }
+  const detail = diagnosticDetailText(check);
+  const match = detail.match(/(\d+)\s*天前/) || detail.match(/changed\s+(\d+)\s+days?\s+ago/i);
+  const extracted = Math.floor(Number(match && match[1]));
+  return Number.isFinite(extracted) && extracted >= 0 && extracted <= 36500 ? extracted : null;
+}
+
+function resultReasonText(check, dictionary, fallback) {
+  if (!check || typeof check !== "object") return "";
+  const base = dictionary[check.reasonCode] || fallback(check);
+  const daysAgo = check.reasonCode === "password_changed" ? passwordChangedDaysAgo(check) : null;
+  return daysAgo == null ? base : `${base}（${daysAgo}天前）`;
+}
+
+function loginCheckResultText(check) {
+  return resultReasonText(check, LOGIN_REASON_TEXT, (item) => (
+    item.outcome === "ok" ? "正常" : (item.outcome === "need_verify" ? "待人工验证" : "登录失败")
+  ));
+}
+
+function passwordCheckResultText(check) {
+  if (!check || typeof check !== "object") return "";
+  return resultReasonText(check, PASSWORD_CHECK_REASON_TEXT, (item) => (
+    item.outcome === "ok" ? "密码正确" : (item.outcome === "need_verify" ? "无法确认密码" : "密码异常")
+  ));
+}
 const STATUS_OPTIONS = {
   login: ["unknown", "ok", "2fa_error", "need_verify", "failed"],
   gmail: ["unknown", "ok", "banned"],
@@ -27,13 +104,13 @@ const STATUS_OPTIONS = {
   device: ["unknown", "cleaned", "rejected", "seckey"],
   age: ["unknown", "ok", "needs", "verified", "failed"],
   restrict: ["unknown", "ok", "restricted"],
-  phone: ["unknown", "ok", "removed", "none", "failed"],
+  phone: ["unknown", "ok", "pending", "removed", "none", "failed"],
 };
 const STATUS_CLASS = {
   unknown: "s-unknown", ok: "s-ok", open: "s-ok", on: "s-ok", cleaned: "s-ok", verified: "s-ok",
   banned: "s-bad", blocked: "s-bad", rejected: "s-bad", closed: "s-mute", off: "s-mute",
   needs: "s-bad", failed: "s-bad", "2fa_error": "s-bad", need_verify: "s-bad", locked: "s-mute",
-  cf_blocked: "s-mute", seckey: "s-bad", restricted: "s-bad",
+  cf_blocked: "s-mute", seckey: "s-bad", restricted: "s-bad", pending: "s-bad",
   removed: "s-ok", none: "s-unknown",
 };
 const LS = {
@@ -46,6 +123,8 @@ const LS = {
   view: "am_view",
   // 运行日志「只看异常」筛选开关，刷新后保持。
   jobOnlyAbnormal: "am_job_only_abnormal",
+  // “添加两步验证手机号”本次从共享池还是一号一绑池领取，刷新后保持。
+  phoneMode: "am_phone_mode",
 };
 
 // 批量操作里勾选的「动作」按视图各记一套（检测系统/养号管理/出售管理互不同步）：
@@ -98,6 +177,12 @@ let accounts = [];
 let selected = loadSet(LS.accounts);
 let jobId = null;
 let jobPolling = false;
+let jobStarting = false;
+let appReady = false;
+
+function syncRunButton() {
+  el("runBtn").disabled = !appReady || jobStarting || !!jobId || jobPolling;
+}
 // 运行日志：最近一次渲染过的 job（用于筛选开关切换时本地重渲染，无需等下一轮轮询）。
 let lastJob = null;
 // 运行日志：用户手动展开/折叠过的账号 email -> 是否展开。重渲染时尊重它，
@@ -120,11 +205,12 @@ function fmtTime(iso) {
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
 }
 
-const isAbnormal = (a) => a.status.gmail === "banned" || a.status.youtube === "banned" || a.status.gpt === "banned"
+const hasPasswordCheckIssue = (a) => !!(a && a.lastPasswordCheck && a.lastPasswordCheck.outcome !== "ok");
+const isAbnormal = (a) => hasPasswordCheckIssue(a) || a.status.gmail === "banned" || a.status.youtube === "banned" || a.status.gpt === "banned"
   || a.status.gpt === "cf_blocked" || a.status.restrict === "restricted"
   || a.status.login === "2fa_error" || a.status.login === "failed" || a.status.login === "need_verify"
-  || STATUS_KEYS.some((k) => a.status[k] === "blocked" || a.status[k] === "rejected" || a.status[k] === "seckey");
-const isUnchecked = (a) => STATUS_KEYS.every((k) => (a.status[k] || "unknown") === "unknown");
+  || STATUS_KEYS.some((k) => a.status[k] === "blocked" || a.status[k] === "rejected" || a.status[k] === "seckey" || a.status[k] === "pending");
+const isUnchecked = (a) => !a.lastPasswordCheck && STATUS_KEYS.every((k) => (a.status[k] || "unknown") === "unknown");
 
 async function api(path, options) {
   const res = await fetch(path, options);
@@ -139,12 +225,12 @@ async function loadAccounts() {
   render();
 }
 
-// 用户是否正在某个视图的账号表格里编辑（聚焦在某个单元格 / 操作下拉）。
-// 三视图共用完整列模板，任意一个 tbody 内有焦点都算“正在编辑”，
-// 实时刷新这一轮就跳过重渲染，避免打断用户输入或抢走焦点。
+// 用户是否正在某个视图的账号表格里编辑（只认可编辑单元格 / 状态下拉）。
+// 行内“检测”等按钮被点击后也会保留焦点，但按钮焦点不属于编辑；若把它算进去，
+// 任务轮询的每次账号刷新都会被跳过，恰好造成“单独检测后结果不显示”。
 function isEditingAccounts() {
   const active = document.activeElement;
-  if (!active) return false;
+  if (!active || !active.matches('.ec[contenteditable="true"], select.st')) return false;
   return ["rows", "salesRows", "nurtureRows", "scrapRows", "failedRows", "needVerifyRows", "tfaErrorRows", "soldRows"].some((id) => {
     const tb = el(id);
     return tb && tb.contains(active);
@@ -294,6 +380,17 @@ function saleCell(a) {
   return tag;
 }
 
+// “仅验证账号密码”的结果放在密码旁边展示，不占用新的表格列，也不冒充完整登录状态。
+function passwordCheckBadge(a) {
+  const check = a && a.lastPasswordCheck;
+  if (!check || typeof check !== "object") return "";
+  const text = passwordCheckResultText(check);
+  const cls = check.outcome === "ok" ? "ok" : (check.outcome === "need_verify" ? "warn" : "bad");
+  const detail = check.detail ? `；${check.detail}` : "";
+  const checkedAt = check.checkedAt ? `；${fmtTime(check.checkedAt)}` : "";
+  return `<span class="password-check ${cls}" title="${escapeHtml(`${text}${detail}${checkedAt}`)}">${escapeHtml(text)}</span>`;
+}
+
 // 状态列对应的检测项名称，用于下拉的悬停提示（滚动时即使表头看不见也能分清是哪项）。
 const STATUS_FIELD_LABEL = {
   login: "登录", gmail: "Gmail", youtube: "YouTube", payment: "支付", family: "家庭组",
@@ -302,9 +399,18 @@ const STATUS_FIELD_LABEL = {
 
 function statusCell(a, key) {
   const val = a.status[key] || "unknown";
-  const opts = STATUS_OPTIONS[key].map((o) => `<option value="${o}"${o === val ? " selected" : ""}>${STATUS_TEXT[o] || o}</option>`).join("");
+  const loginCheck = key === "login" && a.lastLoginCheck && typeof a.lastLoginCheck === "object"
+    ? a.lastLoginCheck : null;
+  const reasonText = loginCheck ? loginCheckResultText(loginCheck) : "";
+  const legacyText = key === "login" && val === "failed" && !loginCheck ? "失败·需重测" : "";
+  const opts = STATUS_OPTIONS[key].map((o) => {
+    const text = o === val && (reasonText || legacyText) ? (reasonText || legacyText) : (STATUS_TEXT[o] || o);
+    return `<option value="${o}"${o === val ? " selected" : ""}>${escapeHtml(text)}</option>`;
+  }).join("");
   const label = STATUS_FIELD_LABEL[key] || key;
-  return `<select class="st ${STATUS_CLASS[val] || ""}" data-id="${a.id}" data-status="${key}" title="${label}（${STATUS_TEXT[val] || val}）">${opts}</select>`;
+  const detail = loginCheck && loginCheck.detail ? `；${loginCheck.detail}` : "";
+  const title = `${label}（${reasonText || legacyText || STATUS_TEXT[val] || val}）${detail}`;
+  return `<select class="st ${STATUS_CLASS[val] || ""}" data-id="${a.id}" data-status="${key}" title="${escapeHtml(title)}">${opts}</select>`;
 }
 
 function editCell(a, field, value, opts = {}) {
@@ -326,11 +432,11 @@ function accountRowHtml(a, i) {
       <td class="acc-cell">
         <div class="acc-actions">
           <button class="primary slim row-run" data-id="${a.id}" title="用当前批量操作面板的配置，仅对该账号执行">检测</button>
-          <button class="ghost slim row-copy" data-id="${a.id}" title="复制该账号（邮箱----密码----辅助----2FA----年份----国家）">复制</button>
+          <button class="ghost slim row-copy" data-id="${a.id}" title="复制该账号（异常账号末尾会追加具体原因，例如：----人机验证）">复制</button>
           <button class="ghost slim row-sell" data-id="${a.id}" title="导出该账号交付文本并标记为「已售」（已售号不可重复出库）">出库</button>
         </div>
         <div class="acc-email" data-id="${a.id}" title="双击复制邮箱">${escapeHtml(a.email)}</div>
-        <div class="acc-pass">${editCell(a, "password", a.password, { mono: true })}<button class="ghost slim row-copypass" data-id="${a.id}" title="复制该账号密码">复制密码</button></div>
+        <div class="acc-pass">${editCell(a, "password", a.password, { mono: true })}<button class="ghost slim row-copypass" data-id="${a.id}" title="复制该账号密码">复制密码</button>${passwordCheckBadge(a)}</div>
       </td>
       <td class="cat-cell">${categoryCell(a)}</td>
       <td>${editCell(a, "source", sourceOf(a))}</td>
@@ -531,11 +637,26 @@ el("importBtn").addEventListener("click", async () => {
 
 // ---- 折叠面板 ----
 document.querySelectorAll("[data-toggle]").forEach((btn) => {
+  const box = el(btn.dataset.toggle);
+  if (!box) return;
+  const storageKey = `am_panel_${btn.dataset.toggle}`;
+
+  function applyPanelState(open) {
+    box.style.display = open ? "" : "none";
+    btn.textContent = open ? "收起" : "展开";
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+
+  // 以 HTML 初始状态为默认值，并记住用户之后的展开/收起选择。
+  let saved = null;
+  try { saved = localStorage.getItem(storageKey); } catch (_) { /* ignore */ }
+  const defaultOpen = box.style.display !== "none";
+  applyPanelState(saved == null ? defaultOpen : saved === "open");
+
   btn.addEventListener("click", () => {
-    const box = el(btn.dataset.toggle);
-    const hidden = box.style.display === "none";
-    box.style.display = hidden ? "" : "none";
-    btn.textContent = hidden ? "收起" : "展开";
+    const open = box.style.display === "none";
+    applyPanelState(open);
+    try { localStorage.setItem(storageKey, open ? "open" : "closed"); } catch (_) { /* ignore */ }
   });
 });
 
@@ -555,9 +676,15 @@ function onRowChange(e) {
     const id = t.dataset.id;
     const key = t.dataset.status;
     t.className = `st ${STATUS_CLASS[t.value] || ""}`;
-    patch(id, { status: { [key]: t.value } });
+    const body = key === "login"
+      ? { status: { [key]: t.value }, lastLoginCheck: null }
+      : { status: { [key]: t.value } };
+    patch(id, body);
     const acc = accounts.find((a) => a.id === id);
-    if (acc) acc.status[key] = t.value;
+    if (acc) {
+      acc.status[key] = t.value;
+      if (key === "login") acc.lastLoginCheck = null;
+    }
   }
 }
 
@@ -572,17 +699,78 @@ function onRowBlur(e) {
     if (value === maskSecret(acc[field]) || value === acc[field]) return;
   }
   if (acc[field] === value) return;
-  patch(id, { [field]: value });
+  const body = field === "password" ? { [field]: value, lastPasswordCheck: null } : { [field]: value };
   acc[field] = value;
+  if (field === "password") {
+    // 后端会清空两类旧凭据结论；前端同步清并立即重绘，避免保存成功后仍暂时显示旧“密码错误/登录失败”。
+    acc.lastPasswordCheck = null;
+    acc.lastLoginCheck = null;
+    if (acc.status) acc.status.login = "unknown";
+    render();
+    patch(id, body).then(() => render());
+    return;
+  }
+  patch(id, body);
 }
 
 function onRowKeydown(e) {
   if (e.target.matches(".ec") && e.key === "Enter") { e.preventDefault(); e.target.blur(); }
 }
 
+// 复制 / 导出共用的异常原因。按字段写清具体问题，避免只给一个笼统提示；
+// unknown、已关闭支付资料、未开家庭组等中性/正常状态不会被误标。
+const EXPORT_STATUS_WARNING_TEXT = {
+  login: { failed: "登录失败", "2fa_error": "2FA密钥错误", need_verify: "待人工验证" },
+  gmail: { banned: "Gmail封禁" },
+  youtube: { banned: "YouTube封禁" },
+  restrict: { restricted: "服务受限" },
+  payment: { locked: "支付资料有订阅" },
+  gemini: { blocked: "Gemini被拦截" },
+  gpt: { blocked: "GPT授权被拦截", banned: "GPT封禁", cf_blocked: "GPT人机验证" },
+  claude: { blocked: "Claude被拦截" },
+  x: { blocked: "X被拦截" },
+  device: { rejected: "设备验证被拒", seckey: "需要安全代码" },
+  age: { needs: "待年龄验证", failed: "年龄验证失败" },
+  phone: { pending: "手机号待生效/人工确认", failed: "验证电话操作失败" },
+};
+
+function exportWarningText(a) {
+  const status = (a && a.status) || {};
+  const issues = [];
+
+  // 独立密码检测也使用精确原因；密码正确(outcome=ok)不是异常，不追加任何后缀。
+  const passwordCheck = a && a.lastPasswordCheck;
+  const passwordReasonCode = passwordCheck && passwordCheck.reasonCode;
+  const precisePasswordIssue = passwordReasonCode && passwordReasonCode !== "password_correct" && passwordCheck.outcome !== "ok"
+    ? passwordCheckResultText(passwordCheck) : "";
+  if (precisePasswordIssue) issues.push(precisePasswordIssue);
+
+  // 登录动作已经保存了精确原因时优先使用，例如 captcha → 人机验证；
+  // 这样不会再把它降级成笼统的“待人工验证”。
+  const loginCheck = a && a.lastLoginCheck;
+  const reasonCode = loginCheck && loginCheck.reasonCode;
+  const preciseLoginIssue = reasonCode && reasonCode !== "ok" && loginCheck.outcome !== "ok" ? loginCheckResultText(loginCheck) : "";
+  if (preciseLoginIssue) issues.push(preciseLoginIssue);
+
+  Object.entries(EXPORT_STATUS_WARNING_TEXT).forEach(([field, values]) => {
+    if (field === "login" && preciseLoginIssue) return;
+    const text = values[status[field]];
+    if (text) issues.push(text);
+  });
+
+  return [...new Set(issues)].join("、");
+}
+
+function hasExportWarning(a) {
+  return !!exportWarningText(a);
+}
+
 // 单账号导出格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家
+// 异常账号追加具体原因，例如：----人机验证
 function fmtAccount(a) {
-  return [a.email || "", a.password || "", a.recoveryEmail || "空", a.totpSecret || "", a.year || "", a.country || ""].join("----");
+  const base = [a.email || "", a.password || "", a.recoveryEmail || "空", a.totpSecret || "", a.year || "", a.country || ""].join("----");
+  const warning = exportWarningText(a);
+  return warning ? `${base}----${warning}` : base;
 }
 
 let toastTimer = null;
@@ -640,6 +828,8 @@ async function onRowClick(e) {
   // 单行「检测/单独运行」：用批量操作面板当前配置只对该账号发起任务（复用 startJob 的校验与发起逻辑）。
   const runBtn = e.target.closest(".row-run");
   if (runBtn) {
+    // 释放按钮焦点，让轮询软刷新可以在首轮就重绘这一行。
+    runBtn.blur();
     startJob([runBtn.dataset.id]);
     return;
   }
@@ -1462,6 +1652,7 @@ function applyView(view) {
   // 未知值安全回退到 detect。
   const v = (view === "sales" || view === "nurture" || view === "scrap" || view === "failed" || view === "needverify" || view === "tfaerror" || view === "sold") ? view : "detect";
   currentView = v;
+  el("detectQuickTools").hidden = v !== "detect";
   el("viewDetect").hidden = v !== "detect";
   el("viewNurture").hidden = v !== "nurture";
   el("viewScrap").hidden = v !== "scrap";
@@ -1573,16 +1764,16 @@ function currentMode() {
   const r = document.querySelector('input[name="runMode"]:checked');
   return r ? r.value : "local";
 }
-// 本机模式下：隐藏 API Key / 随机指纹 / AdsPower 代理池 / 窗口选择，改为只看并发数 + 规划中代理占位。
+// 本机模式只保留必要开关；AdsPower 专属配置在切到兼容模式后再显示。
 function syncModeVisibility() {
   const local = currentMode() === "local";
   el("apiKeyField").hidden = local;
   el("optRandomFp").hidden = local;
   el("optProxy").hidden = local;
-  el("optLocalProxy").hidden = !local;
+  el("optLocalProxy").hidden = true;
   el("envField").hidden = local;
-  el("localHint").hidden = !local;
-  el("maxConcurrentLabel").textContent = local ? "并发数（同时开几个本机浏览器）" : "最大并发";
+  el("localHint").hidden = true;
+  el("maxConcurrentLabel").textContent = local ? "并发数" : "最大并发";
   if (local) { el("proxyBox").hidden = true; }
   else { syncProxyVisibility(); }
 }
@@ -1614,7 +1805,7 @@ function saveProxyForm() {
   localStorage.setItem(LS.proxy, JSON.stringify(readProxyForm()));
 }
 function syncProxyVisibility() {
-  el("proxyBox").hidden = !el("useProxy").checked;
+  el("proxyBox").hidden = currentMode() === "local" || !el("useProxy").checked;
 }
 function loadProxyForm() {
   let p = {};
@@ -1651,6 +1842,7 @@ async function loadProxyTags() {
 }
 // 勾上代理时自动拉一次标签（避免还要手点）。
 function maybeAutoLoadTags() {
+  if (currentMode() !== "adspower") return;
   if (el("useProxy").checked && !proxyTagsLoaded) loadProxyTags();
 }
 el("useProxy").addEventListener("change", () => { saveProxyForm(); syncProxyVisibility(); maybeAutoLoadTags(); });
@@ -1735,7 +1927,7 @@ async function loadActions() {
     const savedActions = loadActionsSet(currentView);
     el("actionList").innerHTML = (data.actions || []).map((a) => `
       <label class="action-item">
-        <input type="checkbox" value="${a.id}"${savedActions.has(a.id) ? " checked" : ""} />
+        <input type="checkbox" value="${a.id}" data-exclusive="${a.exclusive ? "1" : "0"}"${savedActions.has(a.id) ? " checked" : ""} />
         <span>${escapeHtml(a.label)}</span>
         <span class="risk risk-${a.risk}">${a.risk === "low" ? "低风险" : a.risk === "medium" ? "中风险" : "高风险"}</span>
       </label>`).join("");
@@ -1744,7 +1936,16 @@ async function loadActions() {
   }
 }
 // 记住勾选的操作
-el("actionList").addEventListener("change", () => {
+el("actionList").addEventListener("change", (e) => {
+  const changed = e.target && e.target.matches('input[type="checkbox"]') ? e.target : null;
+  if (changed && changed.checked) {
+    const all = [...document.querySelectorAll('#actionList input[type="checkbox"]')];
+    if (changed.dataset.exclusive === "1") {
+      all.forEach((input) => { if (input !== changed) input.checked = false; });
+    } else {
+      all.forEach((input) => { if (input.dataset.exclusive === "1") input.checked = false; });
+    }
+  }
   const ids = [...document.querySelectorAll('#actionList input:checked')].map((c) => c.value);
   saveSet(actionsKeyFor(currentView), new Set(ids));
 });
@@ -1753,8 +1954,12 @@ el("actionList").addEventListener("change", () => {
 // 按钮（传 [a.id]）都调用它，避免复制校验/发起逻辑。唯一区别是执行范围 ids 不同，
 // 其余（动作、运行模式、窗口、代理/指纹/清数据/保留窗口等）都取批量操作面板的当前配置。
 async function startJob(ids) {
+  if (!appReady) {
+    el("runStatus").textContent = "账号和操作仍在加载，请稍候";
+    return;
+  }
   // 并发约束：已有任务在运行（jobId 存在或正在轮询）时不重复发起，避免两个任务互相打架。
-  if (jobId || jobPolling) {
+  if (jobStarting || jobId || jobPolling) {
     toast("已有任务在运行，请先停止或等待完成");
     el("runStatus").textContent = "已有任务在运行，请先停止或等待完成";
     return;
@@ -1767,7 +1972,8 @@ async function startJob(ids) {
   if (!local && !envSerials.length) { el("runStatus").textContent = "请先加载并勾选至少一个窗口"; return; }
   if (!accountIds.length) { el("runStatus").textContent = "请先在账号库勾选账号"; return; }
   if (!actionIds.length) { el("runStatus").textContent = "请选择至少一个操作"; return; }
-  el("runBtn").disabled = true;
+  jobStarting = true;
+  syncRunButton();
   el("runStatus").textContent = "启动中…";
   try {
     const data = await api("/api/automation/run", {
@@ -1780,6 +1986,7 @@ async function startJob(ids) {
         randomFp: el("randomFp").checked,
         clearData: el("clearData").checked,
         keepOpen: el("keepOpen").checked,
+        phoneMode: readPhoneRunMode(),
         // 本机模式代理仍在规划中：不传 AdsPower 代理池配置（后端会忽略）。
         proxy: local ? null : readProxyForm(),
         accountIds, actionIds,
@@ -1787,6 +1994,11 @@ async function startJob(ids) {
     });
     jobId = data.jobId;
     jobManualExpand.clear(); // 新任务：清掉上一批的手动展开/折叠记录，按默认规则重新折叠
+    // 单行“检测”就是为了马上看这个账号的结果：无论成功/失败，任务卡默认展开。
+    if (accountIds.length === 1) {
+      const single = accounts.find((a) => a.id === accountIds[0]);
+      if (single && single.email) jobManualExpand.set(single.email, true);
+    }
     el("runStatus").textContent = `任务已启动（${accountIds.length} 账号 · ${actionIds.length} 操作）`;
     el("stopBtn").disabled = false;
     renderJob(data.job);
@@ -1794,7 +2006,8 @@ async function startJob(ids) {
   } catch (err) {
     el("runStatus").textContent = err.message;
   } finally {
-    el("runBtn").disabled = false;
+    jobStarting = false;
+    syncRunButton();
   }
 }
 
@@ -1816,6 +2029,28 @@ el("stopBtn").addEventListener("click", async () => {
 
 // 「需人工」判定里要扫描的 detail 关键词（多见于移除设备被风控拦下）。
 const ATTENTION_DETAIL_KEYWORDS = ["拒绝验证", "确认是你本人", "安全码", "无法验证身份", "未通过"];
+const JOB_ACTION_TEXT = {
+  login: "登录",
+  "check-password": "密码检测",
+  "detect-ban": "Gmail/YouTube",
+  "detect-restrict": "服务限制",
+  "detect-region": "账号归属地",
+  "detect-gpt": "GPT 授权",
+  "change-language": "更改语言",
+  "change-2fa": "更改 2FA",
+  "remove-devices": "移除设备",
+  "remove-phones": "移除验证电话",
+  "add-2fa-phone": "添加验证手机号",
+  "gemini-check": "Gemini",
+  "age-verify": "年龄验证",
+  "age-verify-close": "年龄验证并关支付",
+  "close-payment": "关闭支付资料",
+};
+const JOB_OUTCOME_TEXT = {
+  ok: "成功", error: "失败", need_verify: "需人工", blocked: "被拦截",
+  skipped: "已跳过", rejected: "拒绝验证", seckey: "需要安全代码",
+};
+const JOB_STATUS_TEXT = { queued: "排队中", running: "检测中", done: "已完成", error: "失败", cancelled: "已停止" };
 
 // 判定一个账号 task 是否「异常/需人工」。用于顶部汇总、「只看异常」筛选与默认展开。
 // 满足以下任一条件即算需人工：
@@ -1823,7 +2058,7 @@ const ATTENTION_DETAIL_KEYWORDS = ["拒绝验证", "确认是你本人", "安全
 //  - 任一动作结果 outcome === "error"（执行报错）；
 //  - 任一动作结果 outcome === "skipped"（被跳过，通常是前置失败连带没跑）；
 //  - 任一动作 outcome 为 rejected / seckey（被拒验 / 需安全码，多见于移除设备）；
-//  - login 动作 outcome 不是 "ok"（need_verify / 2fa_error / failed 等登录没成功）；
+//  - login / check-password 动作 outcome 不是 "ok"（登录或密码检测未通过）；
 //  - 移除设备类动作（action 含 "device"）的 detail 文本里出现人工关键词。
 function taskNeedsAttention(t) {
   if (!t) return false;
@@ -1832,9 +2067,9 @@ function taskNeedsAttention(t) {
   for (const r of (t.results || [])) {
     if (!r) continue;
     const outcome = r.outcome;
-    if (outcome === "error" || outcome === "skipped") return true;
+    if (outcome === "error" || outcome === "need_verify" || outcome === "skipped") return true;
     if (outcome === "rejected" || outcome === "seckey") return true;
-    if (r.action === "login" && outcome !== "ok") return true;
+    if ((r.action === "login" || r.action === "check-password") && outcome !== "ok") return true;
     if (typeof r.action === "string" && r.action.includes("device")) {
       const text = r.detail ? Object.values(r.detail).filter(Boolean).join(" ") : "";
       if (ATTENTION_DETAIL_KEYWORDS.some((k) => text.includes(k))) return true;
@@ -1869,9 +2104,15 @@ function renderJob(job) {
     const lines = (t.results || []).map((r) => {
       const msg = r.detail ? Object.values(r.detail).filter(Boolean).join("；") : "";
       const mark = r.outcome === "ok" ? "✓" : (r.outcome === "error" ? "✗" : "•");
-      return `<div class="job-line out-${escapeHtml(r.outcome)}">${mark} ${escapeHtml(r.action)}: ${escapeHtml(r.outcome)}${msg ? " — " + escapeHtml(msg) : ""}</div>`;
+      const actionText = JOB_ACTION_TEXT[r.action] || r.action;
+      const outcomeText = r.action === "check-password"
+        ? (passwordCheckResultText(r) || JOB_OUTCOME_TEXT[r.outcome] || r.outcome)
+        : r.action === "login" && r.reasonCode
+          ? (loginCheckResultText(r) || JOB_OUTCOME_TEXT[r.outcome] || r.outcome)
+        : (JOB_OUTCOME_TEXT[r.outcome] || r.outcome);
+      return `<div class="job-line out-${escapeHtml(r.outcome)}">${mark} ${escapeHtml(actionText)}：${escapeHtml(outcomeText)}${msg ? " — " + escapeHtml(msg) : ""}</div>`;
     }).join("");
-    const head = t.error ? `错误：${t.error}` : t.status;
+    const head = t.error ? `错误：${t.error}` : (JOB_STATUS_TEXT[t.status] || t.status);
     return `<div class="job-task ${t.status}${needs ? " needs-attn" : ""}${expanded ? "" : " folded"}" data-email="${escapeHtml(t.email)}">
       <div class="job-task-head">
         <span class="job-caret">${expanded ? "▾" : "▸"}</span>
@@ -1921,11 +2162,35 @@ el("jobBoard").addEventListener("change", (e) => {
 function clearJob() {
   jobId = null;
   try { localStorage.removeItem(LS.job); } catch (_) { /* ignore */ }
+  syncRunButton();
+}
+
+function completedJobText(job) {
+  const tasks = (job && job.tasks) || [];
+  if (job && job.status === "cancelled") return "已停止";
+  if (tasks.length === 1) {
+    const task = tasks[0];
+    const credentialResult = (task.results || []).find((r) => r && (r.action === "login" || r.action === "check-password"));
+    if (credentialResult) {
+      const reason = credentialResult.action === "check-password"
+        ? (passwordCheckResultText(credentialResult) || JOB_OUTCOME_TEXT[credentialResult.outcome] || credentialResult.outcome)
+        : credentialResult.reasonCode
+          ? (loginCheckResultText(credentialResult) || JOB_OUTCOME_TEXT[credentialResult.outcome] || credentialResult.outcome)
+        : (JOB_OUTCOME_TEXT[credentialResult.outcome] || credentialResult.outcome);
+      const label = credentialResult.action === "check-password" ? "密码" : "登录";
+      return `检测完成：${task.email} · ${label}：${reason}`;
+    }
+    if (task.error) return `检测失败：${task.email} · ${task.error}`;
+    return `检测完成：${task.email}`;
+  }
+  const abnormal = tasks.filter(taskNeedsAttention).length;
+  return `检测完成：${tasks.length} 个账号${abnormal ? `，${abnormal} 个需人工/异常` : "，全部正常"}`;
 }
 
 async function pollJob() {
   if (jobPolling || !jobId) return;
   jobPolling = true;
+  syncRunButton();
   try { localStorage.setItem(LS.job, jobId); } catch (_) { /* ignore */ }
   while (jobId) {
     const res = await fetch(`/api/automation/jobs/${jobId}`).catch(() => null);
@@ -1935,9 +2200,12 @@ async function pollJob() {
       // 实时刷新账号库：引擎每完成一个动作就已写回库，这里逐轮拉取即可让
       // “每个账号一完成就显示最新检测状态”，无需等整个 job 跑完。
       await refreshAccountsSoft();
+      // 添加手机号会依次经历 reserved → pending → used/failed；同步刷新池，让用户无需手动刷新
+      // 就能看到号码已经被哪个账号领取、是否已确认生效或仍需人工处理。
+      if ((job.actionIds || []).includes("add-2fa-phone")) await loadPhones({ skipIfEditing: true });
       if (job.status === "done" || job.status === "cancelled") {
         el("stopBtn").disabled = true;
-        if (job.status === "cancelled") el("runStatus").textContent = "已停止";
+        el("runStatus").textContent = completedJobText(job);
         clearJob(); // 进入终态：清掉 jobId 让 while 退出，轮询自动停止，不再空转
         break;
       }
@@ -1949,27 +2217,31 @@ async function pollJob() {
     await new Promise((r) => setTimeout(r, 2000));
   }
   jobPolling = false;
+  syncRunButton();
 }
 
 // 页面刷新/重新进入时，若存在仍在运行的 job 则恢复实时轮询；否则清掉记录。
-function resumeJobIfAny() {
+async function resumeJobIfAny() {
   let saved = "";
   try { saved = localStorage.getItem(LS.job) || ""; } catch (_) { saved = ""; }
   if (!saved) return;
   jobId = saved;
-  fetch(`/api/automation/jobs/${saved}`).then((res) => {
-    if (!res.ok) { clearJob(); return null; }
-    return res.json().then(({ job }) => {
-      renderJob(job);
-      if (job.status === "running") {
-        el("stopBtn").disabled = false;
-        el("runStatus").textContent = "检测到运行中的任务，已恢复实时刷新";
-        pollJob();
-      } else {
-        clearJob(); // 已是终态：不需要轮询了
-      }
-    });
-  }).catch(() => { clearJob(); });
+  syncRunButton();
+  try {
+    const res = await fetch(`/api/automation/jobs/${saved}`);
+    if (!res.ok) { clearJob(); return; }
+    const { job } = await res.json();
+    renderJob(job);
+    if (job.status === "running") {
+      el("stopBtn").disabled = false;
+      el("runStatus").textContent = "检测到运行中的任务，已恢复实时刷新";
+      pollJob();
+    } else {
+      clearJob(); // 已是终态：不需要轮询了
+    }
+  } catch (_) {
+    clearJob();
+  }
 }
 
 // ---- 信用卡卡池 ----
@@ -2013,6 +2285,7 @@ function renderCards() {
       <td><button class="ghost danger slim card-del" data-cid="${c.id}">删</button></td>
     </tr>`;
   }).join("");
+  el("cardTableWrap").hidden = cards.length === 0;
   el("cardEmptyHint").style.display = cards.length ? "none" : "block";
   el("cardBadge").textContent = `${cards.length} 张（未用 ${cards.filter((c) => c.status === "unused").length}）`;
   el("cardSelectAll").checked = rows.length > 0 && rows.every((c) => cardSelected.has(c.id));
@@ -2113,15 +2386,287 @@ el("cardRows").addEventListener("click", async (e) => {
   await loadCards();
 });
 
-loadAccounts()
-  .then(() => resumeJobIfAny()) // 先有账号数据，再恢复运行中 job 的实时刷新
-  .catch((err) => { el("importStatus").textContent = err.message; });
+// ---- 两步验证手机号池 ----
+const PHONE_STATUS_TEXT = {
+  unused: "未用", reserved: "已占用", pending: "待生效 / 待确认", used: "已用", failed: "失败", disabled: "停用",
+};
+const PHONE_STATUS_CLASS = {
+  unused: "s-unknown", reserved: "s-mute", pending: "s-bad", used: "s-ok", failed: "s-bad", disabled: "s-mute",
+};
+const PHONE_USAGE_MODE_TEXT = { shared: "共享号码", exclusive: "一号一绑" };
+const PHONE_FALLBACK_MANUAL_STATUSES = {
+  unused: ["unused", "used", "failed", "disabled"],
+  reserved: ["reserved"],
+  pending: ["pending"],
+  used: ["used"],
+  failed: ["failed", "unused", "disabled"],
+  disabled: ["disabled", "unused", "failed"],
+};
+let phones = [];
+let phoneSelected = new Set();
+
+function normalizePhoneUsageMode(value) {
+  return value === "exclusive" ? "exclusive" : "shared";
+}
+
+function phoneUsageMode(item) {
+  return normalizePhoneUsageMode(item && item.usageMode);
+}
+
+function phoneBindingCount(item) {
+  const count = Math.floor(Number(item && item.bindingCount));
+  return Number.isFinite(count) && count > 0 ? count : 0;
+}
+
+function phoneIsAvailable(item) {
+  if (item && typeof item.available === "boolean") return item.available;
+  // 兼容页面热更新期间尚未带 available 的旧 DTO；旧接口只有 unused 可领取。
+  return !!(item && item.status === "unused");
+}
+
+function phoneStatusPresentation(item) {
+  const mode = phoneUsageMode(item);
+  const count = phoneBindingCount(item);
+  if (mode === "shared" && phoneIsAvailable(item)) {
+    return { text: `共享可用（已绑 ${count}）`, cls: "s-ok" };
+  }
+  if (mode === "exclusive" && item && item.status === "used") {
+    return { text: "一号一绑·已用", cls: "s-ok" };
+  }
+  return {
+    text: PHONE_STATUS_TEXT[item && item.status] || (item && item.status) || "未知",
+    cls: PHONE_STATUS_CLASS[item && item.status] || "",
+  };
+}
+
+function readPhoneRunMode() {
+  const select = el("phoneRunMode");
+  return normalizePhoneUsageMode(select && select.value);
+}
+
+const storedPhoneRunMode = (() => {
+  try { return localStorage.getItem(LS.phoneMode); } catch (_) { return null; }
+})();
+el("phoneRunMode").value = normalizePhoneUsageMode(storedPhoneRunMode);
+el("phoneRunMode").addEventListener("change", () => {
+  const value = readPhoneRunMode();
+  el("phoneRunMode").value = value;
+  try { localStorage.setItem(LS.phoneMode, value); } catch (_) { /* ignore */ }
+});
+
+function isEditingPhonePool() {
+  const active = document.activeElement;
+  const rows = el("phoneRows");
+  return !!(active && rows && rows.contains(active)
+    && active.matches('.ec[contenteditable="true"], select[data-phone-status], select[data-phone-mode]'));
+}
+
+function filteredPhones() {
+  const filter = el("phoneFilter").value;
+  return phones.filter((item) => !filter || item.status === filter);
+}
+
+function phoneDeleteProtected(item) {
+  return !!(item && (phoneBindingCount(item) > 0
+    || item.status === "reserved" || item.status === "pending" || item.status === "used"));
+}
+
+function renderPhones() {
+  const rows = filteredPhones();
+  const byId = new Map(phones.map((item) => [item.id, item]));
+  phoneSelected = new Set([...phoneSelected].filter((id) => byId.has(id) && !phoneDeleteProtected(byId.get(id))));
+  el("phoneRows").innerHTML = rows.map((item, index) => {
+    const allowed = Array.isArray(item.allowedStatuses) && item.allowedStatuses.length
+      ? item.allowedStatuses : (PHONE_FALLBACK_MANUAL_STATUSES[item.status] || [item.status]);
+    const statusView = phoneStatusPresentation(item);
+    const options = allowed.map((status) => {
+      const text = status === item.status ? statusView.text : (PHONE_STATUS_TEXT[status] || status);
+      return `<option value="${status}"${status === item.status ? " selected" : ""}>${escapeHtml(text)}</option>`;
+    }).join("");
+    const mode = phoneUsageMode(item);
+    const modeOptions = Object.entries(PHONE_USAGE_MODE_TEXT).map(([value, text]) => (
+      `<option value="${value}"${value === mode ? " selected" : ""}>${escapeHtml(text)}</option>`
+    )).join("");
+    const bindingCount = phoneBindingCount(item);
+    const statusDetail = item.lastError ? `<div class="muted" title="${escapeHtml(item.lastError)}">${escapeHtml(item.lastError)}</div>` : "";
+    const masked = item.maskedNumber || `•••• ${escapeHtml(item.last4 || "")}`;
+    const deleteProtected = phoneDeleteProtected(item);
+    return `<tr data-id="${item.id}">
+      <td class="col-check"><input type="checkbox" data-phone-id="${item.id}"${phoneSelected.has(item.id) ? " checked" : ""}${deleteProtected ? " disabled" : ""} /></td>
+      <td class="muted">${index + 1}</td>
+      <td><span class="mono" title="手机号已脱敏">${escapeHtml(masked)}</span></td>
+      <td><select class="filter-select phone-mode-select" data-phone-id="${item.id}" data-phone-mode="1" title="切换号码的分配模式">${modeOptions}</select></td>
+      <td><select class="st phone-status-select ${statusView.cls}" data-phone-id="${item.id}" data-phone-status="1"${allowed.length === 1 ? " disabled" : ""}>${options}</select></td>
+      <td class="muted phone-binding-count" title="已成功绑定的账号数量">${bindingCount}</td>
+      <td class="muted nowrap" title="${escapeHtml(item.usedBy || "")}">${escapeHtml(item.usedBy || "")}</td>
+      <td><span class="ec" contenteditable="true" data-phone-id="${item.id}" data-phone-field="notes">${escapeHtml(item.notes || "")}</span>${statusDetail}</td>
+      <td><button class="ghost danger slim phone-del" data-phone-id="${item.id}"${deleteProtected ? ' disabled title="该状态受保护，不能删除"' : ""}>删</button></td>
+    </tr>`;
+  }).join("");
+  el("phoneTableWrap").hidden = phones.length === 0;
+  el("phoneEmptyHint").style.display = phones.length ? "none" : "block";
+  const sharedAvailable = phones.filter((item) => phoneUsageMode(item) === "shared" && phoneIsAvailable(item)).length;
+  const exclusiveUnused = phones.filter((item) => phoneUsageMode(item) === "exclusive" && phoneIsAvailable(item)).length;
+  const pending = phones.filter((item) => item.status === "pending").length;
+  el("phoneBadge").textContent = `${phones.length} 个（共享可用 ${sharedAvailable}，一号一绑未用 ${exclusiveUnused}${pending ? `，待确认 ${pending}` : ""}）`;
+  const deletable = rows.filter((item) => !phoneDeleteProtected(item));
+  el("phoneSelectAll").disabled = deletable.length === 0;
+  el("phoneSelectAll").checked = deletable.length > 0 && deletable.every((item) => phoneSelected.has(item.id));
+}
+
+async function loadPhones(options = {}) {
+  if (options.skipIfEditing && isEditingPhonePool()) return false;
+  try {
+    const data = await api("/api/phones");
+    phones = data.phones || [];
+    renderPhones();
+    return true;
+  } catch (err) {
+    el("phoneImportStatus").textContent = err.message;
+    return false;
+  }
+}
+
+async function phonePatch(id, body) {
+  try {
+    const data = await api(`/api/phones/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    const index = phones.findIndex((item) => item.id === id);
+    if (index >= 0 && data.phone) phones[index] = data.phone;
+    renderPhones();
+    return true;
+  } catch (err) {
+    el("phoneImportStatus").textContent = `保存失败：${err.message}`;
+    await loadPhones();
+    return false;
+  }
+}
+
+el("phoneImportBtn").addEventListener("click", async () => {
+  const text = el("phoneImportText").value;
+  const usageMode = normalizePhoneUsageMode(el("phoneImportMode").value);
+  if (!text.trim()) { el("phoneImportStatus").textContent = "请粘贴带国家码的手机号"; return; }
+  el("phoneImportBtn").disabled = true;
+  try {
+    const data = await api("/api/phones/import", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text, usageMode }),
+    });
+    phones = data.phones || [];
+    el("phoneImportText").value = "";
+    el("phoneImportStatus").textContent = `${PHONE_USAGE_MODE_TEXT[usageMode]}：新增 ${data.added}，重复跳过 ${data.dup}，共 ${data.total}`
+      + (data.errors && data.errors.length ? `，${data.errors.length} 行无法识别` : "");
+    renderPhones();
+  } catch (err) {
+    el("phoneImportStatus").textContent = err.message;
+  } finally {
+    el("phoneImportBtn").disabled = false;
+  }
+});
+
+el("phoneDeleteBtn").addEventListener("click", async () => {
+  if (!phoneSelected.size) { el("phoneImportStatus").textContent = "先勾选要删除的手机号"; return; }
+  if (!confirm(`确认删除选中的 ${phoneSelected.size} 个手机号？占用中、待生效/待确认和已使用号码都会被保护。`)) return;
+  try {
+    const data = await api("/api/phones/delete", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: [...phoneSelected] }),
+    });
+    phones = data.phones || [];
+    phoneSelected = new Set();
+    renderPhones();
+  } catch (err) {
+    el("phoneImportStatus").textContent = err.message;
+    await loadPhones();
+  }
+});
+
+el("phoneSelectAll").addEventListener("change", (event) => {
+  const rows = filteredPhones().filter((item) => !phoneDeleteProtected(item));
+  if (event.target.checked) rows.forEach((item) => phoneSelected.add(item.id));
+  else rows.forEach((item) => phoneSelected.delete(item.id));
+  renderPhones();
+});
+
+el("phoneFilter").addEventListener("change", renderPhones);
+
+el("phoneRows").addEventListener("change", async (event) => {
+  const target = event.target;
+  if (target.matches('input[type="checkbox"]')) {
+    const id = target.dataset.phoneId;
+    if (target.checked) phoneSelected.add(id); else phoneSelected.delete(id);
+    renderPhones();
+  } else if (target.matches("select[data-phone-mode]")) {
+    const item = phones.find((entry) => entry.id === target.dataset.phoneId);
+    const previous = phoneUsageMode(item);
+    const next = normalizePhoneUsageMode(target.value);
+    if (!item || previous === next) return;
+    target.disabled = true;
+    await phonePatch(target.dataset.phoneId, { usageMode: next });
+  } else if (target.matches("select[data-phone-status]")) {
+    const item = phones.find((entry) => entry.id === target.dataset.phoneId);
+    const previous = item && item.status;
+    const next = target.value;
+    if (!item || !previous || previous === next) return;
+    if ((previous === "reserved" || previous === "pending")
+      && !confirm(`确认把这个${previous === "pending" ? "待生效/待确认" : "占用中"}的号码标记为“${PHONE_STATUS_TEXT[next] || next}”？这会终止当前占用，且不能直接恢复为未用。`)) {
+      target.value = previous;
+      return;
+    }
+    target.disabled = true;
+    await phonePatch(target.dataset.phoneId, { status: next });
+  }
+});
+
+el("phoneRows").addEventListener("blur", (event) => {
+  const target = event.target;
+  if (!target.matches(".ec[data-phone-field]")) return;
+  const item = phones.find((entry) => entry.id === target.dataset.phoneId);
+  const value = target.textContent.trim();
+  if (!item || item.notes === value) return;
+  phonePatch(item.id, { notes: value });
+}, true);
+
+el("phoneRows").addEventListener("keydown", (event) => {
+  if (event.target.matches(".ec[data-phone-field]") && event.key === "Enter") {
+    event.preventDefault();
+    event.target.blur();
+  }
+});
+
+el("phoneRows").addEventListener("click", async (event) => {
+  const button = event.target.closest(".phone-del");
+  if (!button) return;
+  if (!confirm("删除这个手机号？占用中、待生效/待确认和已使用号码不能删除。")) return;
+  try {
+    await api("/api/phones/delete", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: [button.dataset.phoneId] }),
+    });
+    phoneSelected.delete(button.dataset.phoneId);
+    await loadPhones();
+  } catch (err) {
+    el("phoneImportStatus").textContent = err.message;
+  }
+});
+
+Promise.all([loadAccounts(), loadActions()])
+  .then(() => resumeJobIfAny()) // 账号和操作都就绪后，再恢复旧任务并开放首次点击
+  .then(() => { appReady = true; })
+  .catch((err) => {
+    el("importStatus").textContent = err.message;
+    el("runStatus").textContent = "初始化失败，请刷新后重试";
+  })
+  .finally(() => { syncRunButton(); });
 loadCards();
-loadActions();
+loadPhones();
 // 仅在 AdsPower 模式下自动加载窗口/代理；本机模式不发起任何 AdsPower 请求。
 if (currentMode() === "adspower") {
   loadEnvs();
   maybeAutoLoadTags();
 }
-// API Key 改了就自动重拉窗口和标签。
-el("apiKey").addEventListener("change", () => { loadEnvs(); proxyTagsLoaded = false; maybeAutoLoadTags(); });
+// API Key 改了只在 AdsPower 模式重拉窗口和标签，本机模式不发 AdsPower 请求。
+el("apiKey").addEventListener("change", () => {
+  if (currentMode() !== "adspower") return;
+  loadEnvs();
+  proxyTagsLoaded = false;
+  maybeAutoLoadTags();
+});
