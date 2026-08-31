@@ -13,6 +13,9 @@ const db = new JsonDB(DB_FILE, { phones: [] });
 const STATUSES = ["unused", "reserved", "pending", "used", "failed", "disabled"];
 const USAGE_MODES = ["shared", "exclusive"];
 const ACTIVE_STATUSES = new Set(["reserved", "pending"]);
+// 添加手机号动作的硬超时是 6 分钟。手动释放再留 4 分钟余量，避免用户在
+// 正常页面等待期间把仍可能继续点击的 lease 释放给下一个账号。
+const MANUAL_RELEASE_MIN_AGE_MS = 10 * 60 * 1000;
 const MANUAL_STATUS_TRANSITIONS = {
   unused: new Set(["unused", "used", "failed", "disabled"]),
   // 活跃租约只能由自动化动作推进。即便 UI/API 改成 failed/disabled，迟到的点击也可能
@@ -86,6 +89,7 @@ function createFrom(parsed, usageMode = "shared") {
     leaseId: "",
     completedLeaseId: "",
     reservedAt: "",
+    submitIntentAt: "",
     submittedAt: "",
     usedAt: "",
     lastError: "",
@@ -192,11 +196,21 @@ function normalizeItem(item) {
 
   const defaults = {
     usedByAccountId: "", usedBy: "", leaseId: "", completedLeaseId: "",
-    reservedAt: "", submittedAt: "", usedAt: "", lastError: "", notes: "", raw: "",
+    reservedAt: "", submitIntentAt: "", submittedAt: "", usedAt: "", lastError: "", notes: "", raw: "",
     createdAt: "", updatedAt: "",
   };
   for (const [key, value] of Object.entries(defaults)) {
     if (item[key] == null) { item[key] = value; changed = true; }
+  }
+
+  // 兼容旧数据：pending 本身就代表已经跨过不可逆边界；旧 reserved 若已有
+  // submittedAt，也必须视为已经产生提交意图。恢复流程只会处理两个字段都为空的 reserved。
+  if (item.status === "pending" && !item.submitIntentAt) {
+    item.submitIntentAt = String(item.submittedAt || item.reservedAt || item.updatedAt || item.createdAt || nowIso());
+    changed = true;
+  } else if (item.status === "reserved" && item.submittedAt && !item.submitIntentAt) {
+    item.submitIntentAt = String(item.submittedAt);
+    changed = true;
   }
 
   if (!ACTIVE_STATUSES.has(item.status) && bindings.length) {
@@ -293,6 +307,7 @@ function toPublic(item) {
     // 只显示当前租约或最近一次成功账号的邮箱；内部 accountId/bindings 不出 API。
     usedBy: displayUsedBy,
     reservedAt: item.reservedAt || "",
+    submitIntentAt: item.submitIntentAt || "",
     submittedAt: item.submittedAt || "",
     usedAt: item.usedAt || "",
     lastError: redactPhoneText(item.lastError),
@@ -381,7 +396,7 @@ function claimForAccount(account, options = {}) {
   const mode = claimMode(options);
 
   // active 优先于历史 binding，避免异常数据下把仍在提交的任务误报成已完成。
-  let item = items.find((entry) => activeBelongsTo(entry, account));
+  let item = items.find((entry) => (!mode || entry.usageMode === mode) && activeBelongsTo(entry, account));
   if (item && item.status === "reserved") {
     throw stateConflict("该账号已有手机号添加任务正在提交中，请等待当前任务结束后再试");
   }
@@ -393,7 +408,7 @@ function claimForAccount(account, options = {}) {
     return { item, leaseId: item.leaseId, reused: true, alreadyUsed: false, readOnly: true };
   }
 
-  item = items.find((entry) => bindingForAccount(entry, account));
+  item = items.find((entry) => (!mode || entry.usageMode === mode) && bindingForAccount(entry, account));
   if (item) {
     return {
       item,
@@ -415,6 +430,7 @@ function claimForAccount(account, options = {}) {
   item.leaseId = genId("lease");
   item.completedLeaseId = "";
   item.reservedAt = now;
+  item.submitIntentAt = "";
   item.submittedAt = "";
   item.usedAt = "";
   item.lastError = "";
@@ -461,15 +477,42 @@ function restoreRecentOwner(item) {
 function clearActiveLease(item) {
   item.leaseId = "";
   item.reservedAt = "";
+  item.submitIntentAt = "";
   item.submittedAt = "";
 }
 
-/** 号码已提交/短信可能已发出；从此不能自动释放给别的账号。 */
+/**
+ * 在可能产生外部副作用的点击前先落盘。仍保持 reserved，调用方只有在明确确认
+ * 该点击没有提交（例如 Next 只打开了 Save 确认框）后才能 clearSubmitIntent。
+ */
+function markSubmitIntent(id, leaseId, reason = "即将提交手机号，等待页面结果") {
+  const item = validateLease(id, leaseId, new Set(["reserved"]));
+  if (!item || item.submittedAt) return null;
+  if (!item.submitIntentAt) item.submitIntentAt = nowIso();
+  item.lastError = String(reason || "");
+  item.updatedAt = nowIso();
+  db.flushSync();
+  return item;
+}
+
+/** 只有仍为 reserved、尚未真正提交的同一 lease 才能撤销预提交保护。 */
+function clearSubmitIntent(id, leaseId, reason = "") {
+  const item = validateLease(id, leaseId, new Set(["reserved"]));
+  if (!item || item.submittedAt) return null;
+  item.submitIntentAt = "";
+  item.lastError = String(reason || "");
+  item.updatedAt = nowIso();
+  db.flushSync();
+  return item;
+}
+
+/** 号码已提交/短信可能已发出；动作运行期间保持互斥，终态由共享/独享策略分别处理。 */
 function markPending(id, leaseId, reason = "手机号已提交，等待 Google 确认或生效") {
   const item = validateLease(id, leaseId, new Set(["reserved", "pending"]));
   if (!item) return null;
   const now = nowIso();
   item.status = "pending";
+  if (!item.submitIntentAt) item.submitIntentAt = now;
   if (!item.submittedAt) item.submittedAt = now;
   item.lastError = String(reason || "");
   item.updatedAt = now;
@@ -553,8 +596,10 @@ function confirmManualUsed(id, account) {
 }
 
 function markFailed(id, leaseId, reason) {
-  const item = validateLease(id, leaseId, new Set(["reserved", "pending"]));
-  if (!item) return null;
+  // 此安全失败入口只处理尚未提交的 reserved。共享任务终态复用 releaseSharedAttempt；
+  // 独享 pending / durable submit intent 则继续保护，等待人工核对。
+  const item = validateLease(id, leaseId, new Set(["reserved"]));
+  if (!item || item.submittedAt || item.submitIntentAt) return null;
   item.lastError = String(reason || "Google 拒绝该手机号");
   item.completedLeaseId = "";
   clearActiveLease(item);
@@ -572,10 +617,10 @@ function markFailed(id, leaseId, reason) {
   return item;
 }
 
-/** 只允许释放尚未提交的 reserved；pending 永不自动回收。 */
+/** 独享安全释放：只允许尚未提交的 reserved；pending 永不经此入口自动回收。 */
 function release(id, leaseId, reason = "") {
   const item = validateLease(id, leaseId, new Set(["reserved"]));
-  if (!item || item.submittedAt) return null;
+  if (!item || item.submittedAt || item.submitIntentAt) return null;
   clearActiveLease(item);
   item.completedLeaseId = "";
   item.lastError = String(reason || "");
@@ -591,6 +636,111 @@ function release(id, leaseId, reason = "") {
   item.updatedAt = nowIso();
   db.flushSync();
   return item;
+}
+
+/**
+ * 共享号码只在单个账号任务运行期间互斥。任务一旦结束，无论 Google 成功、拒绝、
+ * 超时或要求人工验证，都清掉 active lease，让下一个账号继续使用同一个号码。
+ */
+function releaseSharedAttempt(id, leaseId, reason = "共享号码本次尝试已结束") {
+  const item = validateLease(id, leaseId, ACTIVE_STATUSES);
+  if (!item || item.usageMode !== "shared") return null;
+  restoreAfterAttemptRelease(item, reason);
+  db.flushSync();
+  return item;
+}
+
+function requireReleaseOptions(options) {
+  if (options == null) return {};
+  if (typeof options !== "object" || Array.isArray(options)) throw new Error("释放选项必须是对象");
+  const allowed = new Set(["reason", "expectedReservedAt", "allowFresh"]);
+  if (Object.keys(options).some((key) => !allowed.has(key))) throw new Error("释放选项包含不支持的字段");
+  if (Object.prototype.hasOwnProperty.call(options, "allowFresh") && typeof options.allowFresh !== "boolean") {
+    throw new Error("allowFresh 必须是布尔值");
+  }
+  return options;
+}
+
+function restoreAfterAttemptRelease(item, reason) {
+  clearActiveLease(item);
+  item.completedLeaseId = "";
+  item.lastError = String(reason || "手机号本次账号占用已释放");
+  if (bindingCount(item) > 0) {
+    item.status = "used";
+    restoreRecentOwner(item);
+  } else {
+    item.status = "unused";
+    item.usedByAccountId = "";
+    item.usedBy = "";
+    item.usedAt = "";
+  }
+  item.updatedAt = nowIso();
+  return item;
+}
+
+/**
+ * 释放单条 active lease。
+ * - 共享号码允许用户立即结束当前账号占用，不以成功/失败或是否已提交为前提；
+ * - 一号一绑仅允许释放尚未提交且超过安全时限的 reserved；
+ * - expectedReservedAt 防止旧页面误释放已经变化的新 lease；
+ * - 启动恢复传 allowFresh=true，因为新进程不会继续上一进程内存中的 job。
+ */
+function releaseUnsubmittedReservation(id, options = {}) {
+  const opts = requireReleaseOptions(options);
+  const item = getById(id);
+  if (!item) return null;
+  if (!ACTIVE_STATUSES.has(item.status)) throw stateConflict("只有占用中或待确认的号码可以释放");
+  const reusableShared = item.usageMode === "shared";
+  if (!reusableShared && item.status !== "reserved") {
+    throw stateConflict("一号一绑的待确认号码不能释放，请先人工核对结果");
+  }
+  if (!reusableShared && (item.submittedAt || item.submitIntentAt)) {
+    throw stateConflict("该号码已有提交意图或可能已经提交，不能释放；请人工核对后确认结果");
+  }
+  if (Object.prototype.hasOwnProperty.call(opts, "expectedReservedAt")
+    && String(opts.expectedReservedAt || "") !== String(item.reservedAt || "")) {
+    throw stateConflict("手机号占用已经变化，请刷新后重试");
+  }
+  if (!reusableShared && opts.allowFresh !== true) {
+    const reservedTime = Date.parse(String(item.reservedAt || ""));
+    if (!Number.isFinite(reservedTime)) {
+      throw stateConflict("手机号缺少有效占用时间，请重启服务执行安全恢复");
+    }
+    if (Date.now() - reservedTime < MANUAL_RELEASE_MIN_AGE_MS) {
+      throw stateConflict("手机号任务可能仍在运行，请停止任务并等待占用超过 10 分钟后再释放");
+    }
+  }
+  restoreAfterAttemptRelease(item, opts.reason);
+  db.flushSync();
+  return item;
+}
+
+/**
+ * 新服务进程启动后恢复上一进程留下的 active lease。jobs 不持久化，旧进程无法继续：
+ * - 共享号码不论 reserved/pending/submit intent 都恢复为可复用；
+ * - 一号一绑只恢复确定尚未提交的 reserved，可能已提交的状态继续保护。
+ */
+function recoverUnsubmittedReservations(options = {}) {
+  const opts = requireReleaseOptions(options);
+  if (Object.prototype.hasOwnProperty.call(opts, "allowFresh") && opts.allowFresh !== true) {
+    throw new Error("启动恢复只支持 allowFresh=true");
+  }
+  const reason = opts.reason || "服务重启后自动恢复手机号池可用状态";
+  const candidates = list().filter((item) => (
+    item.usageMode === "shared" && ACTIVE_STATUSES.has(item.status)
+  ) || (
+    item.status === "reserved" && !item.submittedAt && !item.submitIntentAt
+  ));
+  let toUnused = 0;
+  let toUsed = 0;
+  for (const item of candidates) {
+    const hadBindings = bindingCount(item) > 0;
+    restoreAfterAttemptRelease(item, reason);
+    if (hadBindings) toUsed += 1;
+    else toUnused += 1;
+  }
+  if (candidates.length) db.flushSync();
+  return { released: candidates.length, toUnused, toUsed };
 }
 
 function update(id, patch) {
@@ -711,6 +861,7 @@ function flush() {
 module.exports = {
   STATUSES,
   USAGE_MODES,
+  MANUAL_RELEASE_MIN_AGE_MS,
   MANUAL_STATUS_TRANSITIONS,
   normalizeNumber,
   parseLine,
@@ -722,11 +873,16 @@ module.exports = {
   update,
   remove,
   claimForAccount,
+  markSubmitIntent,
+  clearSubmitIntent,
   markPending,
   confirmUsed,
   confirmManualUsed,
   markFailed,
   release,
+  releaseSharedAttempt,
+  releaseUnsubmittedReservation,
+  recoverUnsubmittedReservations,
   flush,
   _db: db,
 };

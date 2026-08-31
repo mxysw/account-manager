@@ -5,9 +5,9 @@
  *
  * 安全边界：
  * - Add / Next(Send) 各阶段有限次，真正“发送短信”的提交只执行一次；
- * - 出现短信验证码框后只读等待用户在保留的浏览器里亲自输入，绝不把账号 TOTP 填进去；
- * - 短信发出只记 pending，只有成功提示或号码列表明确出现目标号码才记 used / phone=ok；
- * - 提交前失败释放号码，提交后失败继续锁定，避免同号并发分配或重复发短信。
+ * - 出现短信验证码框时绝不把账号 TOTP 填进去；共享任务直接结束并继续下一个账号；
+ * - 只有成功提示或号码列表明确出现目标号码才记 used / phone=ok；
+ * - 共享号码只在当前账号动作执行期间互斥，任一终态都会释放给下一个账号。
  */
 
 const login = require("./login");
@@ -97,8 +97,15 @@ function inspectPhoneDocument(args = {}) {
   };
 
   const dialogs = [...document.querySelectorAll("[role='dialog'], dialog")].filter(visible);
-  const activeDialog = dialogs.length ? dialogs[dialogs.length - 1] : null;
+  // Google/Chrome 有时会同时挂着多个可见 dialog（例如账号/个性化提示）。
+  // 手机号确认框不保证是 DOM 中最后一个；优先选择正文包含目标号码的那个。
+  const targetDialog = [...dialogs].reverse().find((node) => containsTargetNumber(textOf(node), true)) || null;
+  const activeDialog = targetDialog || (dialogs.length ? dialogs[dialogs.length - 1] : null);
   const phaseText = textOf(activeDialog) || bodyTextValue;
+  const hardBlockerRe = /captcha|recaptcha|verify you are human|证明您不是自动程序|验证您不是机器人|人机验证|驗證您是人類|browser or app may not be secure|try using a different browser|浏览器或应用可能不安全/i;
+  // 目标确认框可以和 Chrome/Google 的其它提示同时存在；只有明确的安全/人机弹窗才阻止 Save，
+  // 普通账号提示不能把目标确认框挤成“背景旧文案”。
+  const blockingDialog = dialogs.some((node) => node !== targetDialog && hardBlockerRe.test(textOf(node)));
   const verificationPrompt = /code (was|has been) sent|sent.*verification code|enter (?:the )?(?:6[- ]?digit )?(?:verification )?code|已发送.*验证码|验证码.*(?:已)?发送|输入.*验证码|已傳送.*驗證碼|輸入.*驗證碼/i.test(phaseText);
   const phonePhase = /add (?:a |another )?(?:phone|phone number)|enter (?:a |your )?phone number|添加(?:手机|手机号|电话|电话号码)|输入(?:手机|手机号|电话|电话号码)|新增(?:電話|電話號碼)/i.test(phaseText);
 
@@ -155,8 +162,9 @@ function inspectPhoneDocument(args = {}) {
   const liveRegions = [...document.querySelectorAll("[role='status'], [role='alert'], [aria-live='polite'], [aria-live='assertive']")].filter(visible);
   const successToast = liveRegions.some((node) => successRe.test(textOf(node)));
   const delayedActivation = delayedActivationRe.test(bodyTextValue);
-  const invalidText = /invalid phone|not a valid phone|phone number cannot be used|can'?t use this phone|too many times|too many requests|unsupported phone|请输入有效.*(?:手机|电话)|手机号.*(?:无效|不能使用|次数过多)|電話號碼.*(?:無效|無法使用|次數過多)/i.test(bodyTextValue);
-  const captcha = /captcha|recaptcha|verify you are human|人机验证|驗證您是人類/i.test(bodyTextValue);
+  // 失败文案只读取当前手机号阶段，不能被页面背景残留的旧错误截断 Save。
+  const invalidText = /invalid phone|not a valid phone|phone number cannot be used|can'?t use this phone|too many times|too many requests|unsupported phone|请输入有效.*(?:手机|电话)|手机号.*(?:无效|不能使用|次数过多)|電話號碼.*(?:無效|無法使用|次數過多)/i.test(phaseText);
+  const captcha = hardBlockerRe.test(phaseText) || blockingDialog;
   const addButton = [...document.querySelectorAll("button, a, [role='button']")].filter(visible).some((node) => (
     /add (?:a )?(?:phone|phone number)|添加(?:手机|电话|电话号码)|新增(?:電話|電話號碼)/i.test(norm(`${node.textContent || ""} ${attr(node, "aria-label")}`))
   ));
@@ -189,6 +197,7 @@ function inspectPhoneDocument(args = {}) {
     verificationPrompt,
     invalidText,
     captcha,
+    blockingDialog,
     addButton,
     phoneConfirmation,
     successToast,
@@ -210,6 +219,7 @@ async function inspectPhonePage(page, targetNumber) {
     verificationPrompt: false,
     invalidText: false,
     captcha: false,
+    blockingDialog: false,
     addButton: false,
     phoneConfirmation: false,
     successToast: false,
@@ -319,10 +329,13 @@ function locateScopedButtonDocument(args = {}) {
   } else {
     // 第二阶段 Save 弹窗不再包含手机号输入框；只能在最前景、且正文确实确认目标号码的弹窗内找。
     if (!dialogs.length) return null;
-    const dialog = dialogs[dialogs.length - 1];
-    const dialogText = textOf(dialog);
-    if (!containsTargetNumber(dialogText)
-      || !/phone|number|save|confirm|手机|手机号|电话|电话号码|手機|電話|號碼|保存|确认|儲存|確認/i.test(dialogText)) return null;
+    const dialog = [...dialogs].reverse().find((candidate) => {
+      const dialogText = textOf(candidate);
+      return containsTargetNumber(dialogText)
+        && /phone|number|save|confirm|手机|手机号|电话|电话号码|手機|電話|號碼|保存|确认|儲存|確認/i.test(dialogText)
+        && candidatesIn(candidate).length > 0;
+    }) || null;
+    if (!dialog) return null;
     scope = dialog;
   }
 
@@ -348,6 +361,8 @@ async function clickScoped(page, sources, options = {}) {
   const kind = requestedKind === "save" ? "save"
     : (requestedKind === "next" || requestedKind === "send" ? "next" : "add");
   const targetNumber = typeof options === "object" ? options.targetNumber : "";
+  const beforeClick = typeof options === "object" && typeof options.beforeClick === "function"
+    ? options.beforeClick : null;
   const handle = await withTimeout(page.evaluateHandle(
     locateScopedButtonDocument,
     { sources, kind, targetNumber },
@@ -357,6 +372,16 @@ async function clickScoped(page, sources, options = {}) {
   if (!element) {
     if (typeof handle.dispose === "function") await handle.dispose().catch(() => {});
     return { found: false, attempted: false, confirmed: false };
+  }
+  // Save 之类的不可逆动作必须先把意图持久化，再执行真实 click。这样即使进程
+  // 恰好在 click 后、Promise 返回前退出，启动恢复也不会把可能已提交的号码误释放。
+  if (beforeClick) {
+    try {
+      await beforeClick();
+    } catch (err) {
+      if (typeof handle.dispose === "function") await handle.dispose().catch(() => {});
+      throw err;
+    }
   }
   // 这一行之后无论 click 的 Promise 如何结束，都必须按“可能已产生外部副作用”处理。
   const attempted = true;
@@ -409,16 +434,40 @@ async function drivePhoneFlow(page, account, number, ctx = {}, deps = {}) {
   const navigate = deps.navigate || navigateToPhonePage;
   const addClick = deps.clickAdd || ((targetPage) => clickScoped(targetPage, ADD_TEXT, { kind: "add" }));
   const nextClick = deps.clickNext || deps.clickSend
-    || ((targetPage) => clickScoped(targetPage, NEXT_TEXT, { kind: "next" }));
+    || ((targetPage, beforeClick) => clickScoped(targetPage, NEXT_TEXT, { kind: "next", beforeClick }));
   const saveClick = deps.clickSave
-    || ((targetPage) => clickScoped(targetPage, SAVE_TEXT, { kind: "save", targetNumber: number }));
+    || ((targetPage, beforeClick) => clickScoped(targetPage, SAVE_TEXT, {
+      kind: "save", targetNumber: number, beforeClick,
+    }));
   const fill = deps.fillPhone || fillPhoneField;
   const now = deps.now || (() => Date.now());
   const manualWaitMs = Number.isFinite(ctx.manualCodeWaitMs) ? ctx.manualCodeWaitMs : MANUAL_CODE_WAIT_MS;
   const deadline = now() + (Number.isFinite(ctx.actionTimeoutMs) ? ctx.actionTimeoutMs : ACTION_TIMEOUT_MS);
   let submitted = false;
+  let preliminaryIntent = false;
   let addClicks = 0;
   let completionNoticeSeenBeforeSubmit = false;
+
+  // 某些 Google 版本的 Next 只打开 Save 确认框，另一些会直接发短信。
+  // 点击前先落“可能提交”意图；看到纯确认框后再安全撤销，Save 前重新升级为 pending。
+  const markPreliminaryIntent = async () => {
+    if (preliminaryIntent || submitted) return;
+    if (typeof ctx.onSubmitIntent === "function") await ctx.onSubmitIntent();
+    preliminaryIntent = true;
+  };
+  const clearPreliminaryIntent = async () => {
+    if (!preliminaryIntent || submitted) return;
+    if (typeof ctx.onSubmitIntentCleared === "function") await ctx.onSubmitIntentCleared();
+    preliminaryIntent = false;
+  };
+  const markIrreversible = async () => {
+    if (submitted) return;
+    const onSubmitAttempted = typeof ctx.onSubmitAttempted === "function"
+      ? ctx.onSubmitAttempted : ctx.onSmsRequested;
+    if (typeof onSubmitAttempted === "function") await onSubmitAttempted();
+    submitted = true;
+    preliminaryIntent = false;
+  };
 
   const nav = await navigate(page, account, ctx, emit, deadline);
   if (!nav.ok) return { kind: "blocked", submitted: false, detail: nav.detail || "进入手机号设置失败" };
@@ -464,17 +513,14 @@ async function drivePhoneFlow(page, account, number, ctx = {}, deps = {}) {
   if (!(await fill(page, number))) return { kind: "before_submit_failure", submitted: false, detail: "手机号未能可靠填入，已停止且没有提交" };
 
   // 第一阶段 Next 只进入号码确认弹窗，本身不占用为 pending；真正不可逆边界是第二阶段 Save。
-  const nextAttempt = normalizeClickAttempt(await nextClick(page));
-  if (!nextAttempt.attempted) return { kind: "before_submit_failure", submitted: false, detail: "没有在手机号表单中找到可点击的 Next 按钮，号码未提交" };
+  const nextAttempt = normalizeClickAttempt(await nextClick(page, markPreliminaryIntent));
+  if (!nextAttempt.attempted) {
+    await clearPreliminaryIntent();
+    return { kind: "before_submit_failure", submitted: false, detail: "没有在手机号表单中找到可点击的 Next 按钮，号码未提交" };
+  }
+  // 兼容忽略第二参数的测试/注入驱动；生产 clickScoped 会在真实 click 前调用。
+  await markPreliminaryIntent();
   emit("phone_next_attempted", { last4: number.slice(-4), clickConfirmed: nextAttempt.confirmed });
-
-  const markIrreversible = async () => {
-    if (submitted) return;
-    submitted = true;
-    const onSubmitAttempted = typeof ctx.onSubmitAttempted === "function"
-      ? ctx.onSubmitAttempted : ctx.onSmsRequested;
-    if (typeof onSubmitAttempted === "function") await onSubmitAttempted();
-  };
 
   let sawCodePrompt = false;
   let saveAttempted = false;
@@ -487,24 +533,65 @@ async function drivePhoneFlow(page, account, number, ctx = {}, deps = {}) {
     if (!snap.successToast && !snap.delayedActivation) completionNoticeArmed = true;
     // Next 后、Save 前确认弹窗里的提示仍是基线，不能被本轮 Save 当成新成功证据。
     if (!submitted && (snap.successToast || snap.delayedActivation)) completionNoticeArmed = false;
-    if (snap.invalidText) return { kind: "rejected", submitted, detail: "Google 明确拒绝该手机号（格式/次数/频率限制）" };
-    const text = await bodyText(page);
-    const risk = riskReason(text, page.url());
-    if (snap.captcha || risk) {
-      return { kind: "blocked", submitted, codePromptVisible: sawCodePrompt, detail: risk || "Google 要求人机验证" };
+    if (snap.invalidText) {
+      // Google 明确停在提交前拒绝页时没有待完成副作用，可撤销 Next 的保护意图。
+      if (!submitted) await clearPreliminaryIntent();
+      return { kind: "rejected", submitted, detail: "Google 明确拒绝该手机号（格式/次数/频率限制）" };
+    }
+    if (snap.captcha) {
+      return { kind: "blocked", submitted, codePromptVisible: sawCodePrompt, detail: "Google 要求人机验证或安全检查" };
     }
 
     if (!saveAttempted && snap.phoneConfirmation) {
-      const save = normalizeClickAttempt(await saveClick(page));
+      // 已明确证明 Next 只是打开确认框；此刻尚未 Save，进程退出也可安全恢复。
+      await clearPreliminaryIntent();
+      // 生产 clickScoped 会在真实 click 前调用 markIrreversible。注入的旧测试驱动
+      // 可能忽略第二参数，因此返回后仍幂等补调一次。
+      const save = normalizeClickAttempt(await saveClick(page, markIrreversible));
       if (!save.attempted) {
         return { kind: "before_submit_failure", submitted: false, detail: "已进入号码确认弹窗，但没有找到可点击的 Save 按钮；号码尚未保存" };
       }
       saveAttempted = true;
-      // Save click 一旦尝试，即使触发导航导致 confirmed=false，也必须锁定为 pending，绝不重试。
+      // Save click 一旦尝试，即使触发导航导致 confirmed=false，也必须先记为 pending，绝不重试；
+      // 当前账号任务结束后，共享号码会由上层统一释放，一号一绑仍保守等待核对。
       await markIrreversible();
       emit("phone_save_attempted", { last4: number.slice(-4), clickConfirmed: save.confirmed });
       manualDeadline = null;
       continue;
+    }
+
+    const delayedSuccess = submitted && snap.delayedActivation && completionNoticeArmed
+      && !snap.hasPhoneInput && !snap.hasCodeInput;
+    const directCompletion = !submitted && (snap.listed || snap.explicitSuccess
+      || (snap.successToast && completionNoticeArmed));
+    // 先消费 Save 后的强成功证据，再做全页风控兜底。成功页自身可能包含
+    // “verify it's you / security delay”，那是稍后生效说明，不是额外身份验证。
+    if (directCompletion || (submitted && (snap.listed || snap.explicitSuccess
+      || (snap.successToast && completionNoticeArmed) || delayedSuccess))) {
+      // 少数版本可能在 Next 后直接完成；先把预提交意图升级为正式 pending，
+      // 随后上层 confirmUsed 会原子记录成功绑定并重新开放共享号码。
+      if (!submitted) await markIrreversible();
+      return {
+        kind: "added",
+        submitted: true,
+        explicitSuccess: true,
+        activationDeferred: submitted && snap.delayedActivation && completionNoticeArmed,
+      };
+    }
+
+    // 没有新成功证据时，Save 后仍显示原确认框通常只是退出动画；继续等页面稳定，
+    // 不能把其中的 “verify it's you” 当成可疑登录，也不能重复点 Save。
+    if (saveAttempted && snap.phoneConfirmation) {
+      if (!manualDeadline) manualDeadline = now() + 25000;
+      if (now() >= manualDeadline) break;
+      continue;
+    }
+
+    // 没有目标确认框时才读取全页风险文案；确认框已经精确匹配目标号码时，背景旧文案不能跳过 Save。
+    const text = await bodyText(page);
+    const risk = riskReason(text, page.url());
+    if (risk) {
+      return { kind: "blocked", submitted, codePromptVisible: sawCodePrompt, detail: risk };
     }
 
     if (snap.hasCodeInput || snap.verificationPrompt) {
@@ -517,25 +604,9 @@ async function drivePhoneFlow(page, account, number, ctx = {}, deps = {}) {
       }
       // 这里只读等用户在浏览器里亲自输入验证码；绝不调用 fillField/click/keyboard。
       if (manualWaitMs <= 0 || now() >= manualDeadline) {
-        return { kind: "code_required", submitted: true, codePromptVisible: true, detail: "Google 另行要求短信验证码，请在保留的浏览器窗口中直接输入；号码继续锁定为待确认" };
+        return { kind: "code_required", submitted: true, codePromptVisible: true, detail: "Google 另行要求短信验证码，本账号未完成" };
       }
       continue;
-    }
-
-    const delayedSuccess = submitted && snap.delayedActivation && completionNoticeArmed
-      && !snap.hasPhoneInput && !snap.hasCodeInput;
-    const directCompletion = !submitted && (snap.listed || snap.explicitSuccess
-      || (snap.successToast && completionNoticeArmed));
-    // 通用成功 toast / security-delay 提示只有在 Save attempted 边界之后才可作为成功证据。
-    // 延迟生效提示还要求提交表单与验证码框都已消失，避免把帮助文案当成功。
-    if (directCompletion || (submitted && (snap.listed || snap.explicitSuccess
-      || (snap.successToast && completionNoticeArmed) || delayedSuccess))) {
-      return {
-        kind: "added",
-        submitted: true,
-        explicitSuccess: true,
-        activationDeferred: submitted && snap.delayedActivation && completionNoticeArmed,
-      };
     }
 
     // Save 前只等待确认弹窗；失败仍可安全释放。Save 后才进入不可逆 pending 超时。
@@ -556,7 +627,7 @@ function pendingResult(masked, detail, options = {}) {
     statusPatch: { phone: "pending" },
     detail: { phoneAdd: `${detail || "手机号已提交，等待 Google 确认或生效"}（${masked}）` },
     stop: true,
-    // 只要号码可能已提交，就必须保留现场；验证码框未被新版 DOM 识别也不能关窗。
+    // 一号一绑的提交结果不明时保留现场；共享模式会在 finishSharedAttempt 中关闭本账号窗口并继续队列。
     keepOpen: true,
     handoff: true,
   };
@@ -584,37 +655,135 @@ async function addPhone(page, account, ctx = {}) {
   }
 
   const { item, leaseId } = claim;
-  const masked = maskPhone(item.number);
-  emit("phone_claimed", { poolId: item.id, last4: item.number.slice(-4), reused: !!claim.reused });
-
-  // pending 和 used 都只能只读复核。pool 新接口显式返回 readOnly；旧数据也按状态兜底。
-  const readOnly = claim.readOnly === true || claim.alreadyUsed === true || item.status === "pending" || !!item.submittedAt;
-  let submitted = readOnly;
+  let masked = "••••";
+  let readOnly = false;
+  let submitted = false;
+  const finishSharedAttempt = (result, reason) => {
+    if (phoneMode !== "shared") return result;
+    let releaseFailed = false;
+    if (item && item.id && leaseId) {
+      try {
+        if (typeof pool.releaseSharedAttempt !== "function") {
+          releaseFailed = true;
+        } else {
+          const released = pool.releaseSharedAttempt(item.id, leaseId, reason || "共享号码本次账号尝试已结束");
+          if (!released) {
+            const current = typeof pool.getById === "function" ? pool.getById(item.id) : item;
+            releaseFailed = !!(current && current.leaseId === leaseId
+              && (current.status === "reserved" || current.status === "pending"));
+          }
+        }
+      } catch (_) {
+        releaseFailed = true;
+      }
+    }
+    if (releaseFailed) {
+      const detail = result && result.detail && typeof result.detail === "object" ? result.detail : {};
+      const prefix = detail.phoneAdd ? `${detail.phoneAdd}；` : "";
+      return {
+        ...result,
+        outcome: "error",
+        reasonCode: "phone_pool_state_error",
+        statusPatch: { ...(result.statusPatch || {}), phone: "failed" },
+        detail: { ...detail, phoneAdd: `${prefix}共享号码本次占用释放失败，请在手机号池点击“释放共享占用”` },
+        stop: true,
+        keepOpen: false,
+        handoff: false,
+      };
+    }
+    // 共享号码的单个账号任务结束后必须继续跑下一个，失败/待人工也不能占住批次。
+    const detail = result && result.detail && typeof result.detail === "object" ? result.detail : {};
+    const sharedDetail = String(detail.phoneAdd || "")
+      .replace(/（号码继续锁定为待确认）/g, "")
+      .replace(/[；，]?号码(?:继续)?(?:保持|锁定为)待(?:确认|核对|生效)(?:状态)?/g, "")
+      .replace(/[；，]?号码保持待确认/g, "")
+      .trim();
+    const phoneAdd = detail.phoneAdd
+      ? `${sharedDetail || "本账号的手机号添加任务已结束"}；共享号码已开放给下一个账号`
+      : "本账号的手机号添加任务已结束；共享号码已开放给下一个账号";
+    return {
+      ...result,
+      statusPatch: { ...(result.statusPatch || {}), phone: result.outcome === "ok" ? "ok" : "failed" },
+      detail: { ...detail, phoneAdd },
+      keepOpen: false,
+      handoff: false,
+    };
+  };
   try {
+    if (!item || !item.id) throw new Error("手机号池返回了无效的占用记录");
+    masked = maskPhone(item.number);
+    emit("phone_claimed", { poolId: item.id, last4: item.number.slice(-4), reused: !!claim.reused });
+
+    // pending 和 used 都只能只读复核。pool 新接口显式返回 readOnly；旧数据也按状态兜底。
+    readOnly = claim.readOnly === true || claim.alreadyUsed === true
+      || item.status === "pending" || !!item.submittedAt || !!item.submitIntentAt;
+    submitted = readOnly;
+    let preliminaryIntent = false;
     let submitCallbackUsed = false;
+    const markIntent = async () => {
+      if (preliminaryIntent || submitted) return;
+      if (readOnly) throw new Error("只读复查状态禁止创建手机号提交意图");
+      if (typeof pool.markSubmitIntent !== "function") {
+        throw new Error("手机号池缺少提交意图保护，已停止以防重复提交");
+      }
+      const marked = pool.markSubmitIntent(item.id, leaseId, "即将点击 Next，等待 Google 页面结果");
+      if (!marked) throw new Error("手机号占用状态已变化，已停止以防重复提交");
+      preliminaryIntent = true;
+    };
+    const clearIntent = async () => {
+      if (!preliminaryIntent || submitted) return;
+      if (typeof pool.clearSubmitIntent !== "function") {
+        throw new Error("手机号池无法撤销安全提交意图，已停止并保留号码待核对");
+      }
+      const cleared = pool.clearSubmitIntent(item.id, leaseId, "Next 仅打开确认框，尚未保存手机号");
+      if (!cleared) throw new Error("手机号占用状态已变化，已停止以防重复提交");
+      preliminaryIntent = false;
+    };
     const markSubmitted = async () => {
       if (submitCallbackUsed) return;
       submitCallbackUsed = true;
       if (readOnly) throw new Error("只读复查状态禁止再次提交手机号");
-      submitted = true;
       const marked = pool.markPending(item.id, leaseId, "手机号已提交，等待 Google 确认或生效");
       if (!marked) throw new Error("手机号占用状态已变化，已停止以防重复提交");
+      submitted = true;
+      preliminaryIntent = false;
     };
     const result = await drive(page, account, item.number, {
       ...ctx,
+      // 共享号码以批量继续为优先：Google 若额外要求短信码，当前账号立即结束；
+      // 一号一绑仍可沿用默认等待时间，保留现场供人工完成。
+      manualCodeWaitMs: phoneMode === "shared" ? 0 : ctx.manualCodeWaitMs,
       alreadySubmitted: readOnly,
       readOnly,
+      onSubmitIntent: markIntent,
+      onSubmitIntentCleared: clearIntent,
       onSubmitAttempted: markSubmitted,
       // 兼容已有测试/注入驱动；生产状态机优先调用中性的 onSubmitAttempted。
       onSmsRequested: markSubmitted,
     });
+
+    // Next 后若未能明确观察到“仅确认框”或正式提交结果，先升级为待核对；
+    // 共享模式随后结束当前账号并释放号码，一号一绑则继续保守保护。
+    const afterDrive = pool.getById ? pool.getById(item.id) : null;
+    if (!readOnly && !result.submitted && afterDrive && afterDrive.status === "reserved" && afterDrive.submitIntentAt) {
+      const marked = pool.markPending(item.id, leaseId, result.detail || "Next 后页面状态不明确，等待人工核对");
+      if (marked) {
+        submitted = true;
+        return finishSharedAttempt(pendingResult(masked, result.detail || "Next 后页面状态不明确，号码保持待确认", {
+          smsRequired: result.codePromptVisible === true,
+        }), result.detail || "Next 后页面状态不明确");
+      }
+    }
 
     if (result.explicitSuccess && (result.kind === "added" || result.kind === "already_present")) {
       // 已是 used 的本地记录也必须先通过本次页面复核；复核后无需用空 lease 再 confirm。
       if (!claim.alreadyUsed) {
         const used = pool.confirmUsed(item.id, leaseId);
         if (!used) {
-          return pendingResult(masked, "Google 已显示添加成功，但本地手机号池占用已变化，请人工核对并标记");
+          return finishSharedAttempt(
+            pendingResult(masked, "Google 已显示添加成功，但本地手机号池占用已变化，请人工核对并标记"),
+            "Google 显示成功，但本地确认失败",
+          );
         }
       }
       emit("phone_added", { poolId: item.id, last4: item.number.slice(-4) });
@@ -635,75 +804,92 @@ async function addPhone(page, account, ctx = {}) {
 
     if (claim.alreadyUsed) {
       // 本地 used 不是远端事实；列表未确认时不降级池状态、不冒充 phone=ok。
-      return {
+      return finishSharedAttempt({
         outcome: "need_verify",
         reasonCode: "phone_record_unconfirmed",
         detail: { phoneAdd: `手机号池记为已用，但本次未在 Google 号码列表确认目标号码（${masked}）；未重新发送短信` },
         stop: true,
         keepOpen: true,
         handoff: true,
-      };
+      }, "已绑定记录本次远端复核未确认");
     }
 
     if (readOnly) {
       // pending 的第二任务只读复查：除明确成功可 confirmUsed 外，禁止 mark/release/failed。
-      return pendingResult(masked, result.detail || "该号码此前已提交，等待 Google 确认、生效或人工复核", {
+      return finishSharedAttempt(pendingResult(masked, result.detail || "该号码此前已提交，等待 Google 确认、生效或人工复核", {
         smsRequired: result.codePromptVisible === true,
-      });
+      }), result.detail || "共享号码待确认任务已结束");
     }
 
     if (result.kind === "rejected") {
-      pool.markFailed(item.id, leaseId, result.detail || "Google 拒绝该手机号");
-      return {
+      if (phoneMode !== "shared") pool.markFailed(item.id, leaseId, result.detail || "Google 拒绝该手机号");
+      return finishSharedAttempt({
         outcome: "error",
         reasonCode: "phone_rejected",
         statusPatch: { phone: "failed" },
         detail: { phoneAdd: `${result.detail || "Google 拒绝该手机号"}（${masked}）` },
         stop: true,
-      };
+      }, result.detail || "Google 拒绝该手机号");
     }
 
     if (result.submitted || submitted || result.kind === "code_required" || result.kind === "timeout") {
       pool.markPending(item.id, leaseId, result.detail || "手机号已提交，等待 Google 确认或生效");
-      // 号码一旦可能提交，就保留现场；即使 Google 新版页面没被准确识别成验证码框，
-      // 用户仍可直接查看/完成，且不会因自动关窗丢掉本次短信流程。
-      return pendingResult(masked, result.detail, { smsRequired: result.codePromptVisible === true });
+      // 先记录可能已提交，避免在动作仍运行时并发复用；共享模式会在本账号终态统一释放，
+      // 一号一绑仍保留窗口供人工核对。
+      return finishSharedAttempt(
+        pendingResult(masked, result.detail, { smsRequired: result.codePromptVisible === true }),
+        result.detail || "共享号码提交结果待确认，本次任务已结束",
+      );
     }
 
     // 所有提交前终态都可安全释放。
-    pool.release(item.id, leaseId, result.detail || "提交前中止");
+    if (phoneMode !== "shared") {
+      pool.release(item.id, leaseId, result.detail || "提交前中止");
+    }
     const blockedBeforeSubmit = result.kind === "blocked";
-    return {
+    const releaseNote = phoneMode === "shared" ? "（号码未提交）" : "（号码未提交，已释放）";
+    return finishSharedAttempt({
       outcome: result.kind === "blocked" ? "need_verify" : "error",
       reasonCode: result.kind === "blocked" ? "phone_add_blocked" : "phone_add_failed",
       // 号码尚未提交时，只能说明本次动作没有完成，不能据此覆盖账号原有验证电话状态。
-      detail: { phoneAdd: `${result.detail || "未能打开/填写添加手机号页面"}（号码未提交，已释放）` },
+      detail: { phoneAdd: `${result.detail || "未能打开/填写添加手机号页面"}${releaseNote}` },
       stop: true,
       keepOpen: blockedBeforeSubmit,
       handoff: blockedBeforeSubmit,
-    };
+    }, result.detail || "共享号码本次任务未完成");
   } catch (err) {
     if (claim.alreadyUsed) {
-      return {
+      return finishSharedAttempt({
         outcome: "need_verify",
         reasonCode: "phone_record_unconfirmed",
         detail: { phoneAdd: `手机号池记为已用，但远端复核异常：${err.message}（${masked}）；未重新发送短信` },
         stop: true,
         keepOpen: true,
         handoff: true,
-      };
+      }, `已绑定记录复核异常：${err.message}`);
     }
     if (readOnly) {
-      return pendingResult(masked, `只读复核异常：${err.message}；号码保持待确认状态`);
+      return finishSharedAttempt(
+        pendingResult(masked, `只读复核异常：${err.message}；号码保持待确认状态`),
+        `共享号码只读复核异常：${err.message}`,
+      );
     }
-    const current = pool.getById ? pool.getById(item.id) : null;
-    const isPending = submitted || (current && current.status === "pending");
+    const current = item && item.id && pool.getById ? pool.getById(item.id) : null;
+    const isPending = submitted || (current && (current.status === "pending" || current.submitIntentAt));
     if (isPending) {
       pool.markPending(item.id, leaseId, `提交后页面异常：${err.message}`);
-      return pendingResult(masked, "号码可能已经提交，但页面异常；为防重复提交，继续锁定为待确认");
+      return finishSharedAttempt(
+        pendingResult(masked, "号码可能已经提交，但页面异常；本账号已结束"),
+        `共享号码提交后页面异常：${err.message}`,
+      );
     }
-    pool.release(item.id, leaseId, `提交前异常：${err.message}`);
-    return { outcome: "error", reasonCode: "phone_add_failed", detail: { phoneAdd: `添加手机号异常：${err.message}（号码未提交，已释放）` }, stop: true };
+    if (item && item.id && leaseId && phoneMode !== "shared") {
+      pool.release(item.id, leaseId, `提交前异常：${err.message}`);
+    }
+    return finishSharedAttempt(
+      { outcome: "error", reasonCode: "phone_add_failed", detail: { phoneAdd: `添加手机号异常：${err.message}（本账号已结束）` }, stop: true },
+      `共享号码提交前异常：${err.message}`,
+    );
   }
 }
 

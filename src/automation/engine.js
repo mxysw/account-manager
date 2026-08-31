@@ -186,6 +186,14 @@ function shouldKeepTaskOpen(jobKeepOpen, actionRequested) {
   return !!(jobKeepOpen || actionRequested);
 }
 
+function normalizeJobKeepOpen(actionIds, requestedKeepOpen) {
+  // 添加手机号任务必须用同一个 slot 逐号串行：若沿用全局“跑完保留窗口”，
+  // 首个成功账号也会占住唯一环境，schedule 只能把剩余账号判为无环境。
+  // 动作自身的 keepOpen（短信码 / 人机验证 / 人工接管）不受这里影响，
+  // runTask 仍会通过 shouldKeepTaskOpen(false, true) 保留现场。
+  return !actionIds.includes("add-2fa-phone") && !!requestedKeepOpen;
+}
+
 /**
  * 启动并接管一个本机临时浏览器。
  *
@@ -541,7 +549,7 @@ function createJob({ apiKey, envSerials, accountIds, actionIds, maxConcurrent, t
     // 本机模式没有 AdsPower 指纹概念，randomFp 不适用，固定为 false。
     randomFp: runMode === "local" ? false : randomFp !== false,
     clearData: clearData !== false,
-    keepOpen: !!keepOpen,
+    keepOpen: normalizeJobKeepOpen(selectedActionIds, keepOpen),
     // proxy：AdsPower 代理池字段（enabled/tagId/proxyIds）保持原样；
     // 本机模式预留 proxy.server（规划中，透传给 --proxy-server，UI 暂未对接）。
     proxy: runMode === "local"
@@ -585,6 +593,7 @@ module.exports = {
     isFatalLocalStartupError,
     buildUnhandledLoginResult,
     shouldKeepTaskOpen,
+    normalizeJobKeepOpen,
     isEnvReusable,
     finishQueuedWithoutReusableEnv,
     normalizeAdsSerials,

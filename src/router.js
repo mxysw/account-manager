@@ -354,6 +354,34 @@ const ROUTES = [
     }
   }],
 
+  ["POST", /^\/api\/phones\/([^/]+)\/release-reservation$/, async (req, m) => {
+    const body = await readBody(req);
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return { status: 400, body: { error: "请求体必须只包含 expectedReservedAt 和可选 reason" } };
+    }
+    const keys = Object.keys(body);
+    if (keys.some((key) => key !== "expectedReservedAt" && key !== "reason")) {
+      return { status: 400, body: { error: "请求体只支持 expectedReservedAt 和 reason" } };
+    }
+    const expectedReservedAt = typeof body.expectedReservedAt === "string" ? body.expectedReservedAt.trim() : "";
+    if (!expectedReservedAt) {
+      return { status: 400, body: { error: "请提供当前记录的 expectedReservedAt，防止释放已经变化的占用" } };
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "reason") && typeof body.reason !== "string") {
+      return { status: 400, body: { error: "reason 必须是字符串" } };
+    }
+    try {
+      const phone = phones.releaseUnsubmittedReservation(m[1], {
+        expectedReservedAt,
+        reason: String(body.reason || "用户手动结束手机号本次账号占用").slice(0, 500),
+      });
+      if (!phone) return { status: 404, body: { error: "手机号不存在" } };
+      return { status: 200, body: { phone: phones.toPublic(phone) } };
+    } catch (err) {
+      return { status: err && err.code === "PHONE_STATE_CONFLICT" ? 409 : 400, body: { error: err.message } };
+    }
+  }],
+
   ["PATCH", /^\/api\/phones\/([^/]+)$/, async (req, m) => {
     const body = await readBody(req);
     try {

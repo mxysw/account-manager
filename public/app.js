@@ -2427,6 +2427,9 @@ function phoneIsAvailable(item) {
 function phoneStatusPresentation(item) {
   const mode = phoneUsageMode(item);
   const count = phoneBindingCount(item);
+  if (item && item.status === "reserved" && item.submitIntentAt) {
+    return { text: "提交状态待核对", cls: "s-bad" };
+  }
   if (mode === "shared" && phoneIsAvailable(item)) {
     return { text: `共享可用（已绑 ${count}）`, cls: "s-ok" };
   }
@@ -2511,6 +2514,14 @@ function renderPhones() {
     const masked = item.maskedNumber || `•••• ${escapeHtml(item.last4 || "")}`;
     const deleteProtected = phoneDeleteProtected(item);
     const hasBindings = phoneHasBindings(item);
+    const sharedActive = mode === "shared" && phoneIsBusy(item);
+    const actionButton = sharedActive
+      ? `<button class="ghost slim phone-release" data-phone-id="${item.id}" title="结束本次账号占用，让这个共享号码继续分配给下一个账号">释放共享占用</button>`
+      : item.status === "reserved" && !item.submitIntentAt
+        ? `<button class="ghost slim phone-release" data-phone-id="${item.id}" title="仅释放未提交的旧占用；正在运行或已经提交的号码不会被释放">释放占用</button>`
+      : item.status === "reserved"
+        ? '<button class="ghost slim" disabled title="这个号码可能已经提交，请先核对 Google 页面结果">待核对</button>'
+      : `<button class="ghost danger slim phone-del${hasBindings ? " phone-del-bound" : ""}" data-phone-id="${item.id}"${deleteProtected ? ' disabled title="号码正在等待 Google 确认，不能删除或释放"' : hasBindings ? ' title="删除本地记录（不会从 Google 解绑）"' : ""}>删</button>`;
     return `<tr data-id="${item.id}"${hasBindings ? ' class="phone-bound"' : ""}>
       <td class="col-check"><input type="checkbox" data-phone-id="${item.id}"${phoneSelected.has(item.id) ? " checked" : ""}${deleteProtected ? " disabled" : ""} /></td>
       <td class="muted">${index + 1}</td>
@@ -2520,7 +2531,7 @@ function renderPhones() {
       <td class="muted phone-binding-count" title="已成功绑定的账号数量">${bindingCount}</td>
       <td class="muted nowrap" title="${escapeHtml(item.usedBy || "")}">${escapeHtml(item.usedBy || "")}</td>
       <td><span class="ec" contenteditable="true" data-phone-id="${item.id}" data-phone-field="notes">${escapeHtml(item.notes || "")}</span>${statusDetail}</td>
-      <td><button class="ghost danger slim phone-del${hasBindings ? " phone-del-bound" : ""}" data-phone-id="${item.id}"${deleteProtected ? ' disabled title="号码正在占用或等待确认，暂不能删除"' : hasBindings ? ' title="删除本地记录（不会从 Google 解绑）"' : ""}>删</button></td>
+      <td>${actionButton}</td>
     </tr>`;
   }).join("");
   el("phoneTableWrap").hidden = phones.length === 0;
@@ -2663,6 +2674,33 @@ el("phoneRows").addEventListener("keydown", (event) => {
 });
 
 el("phoneRows").addEventListener("click", async (event) => {
+  const releaseButton = event.target.closest(".phone-release");
+  if (releaseButton) {
+    const item = phones.find((entry) => entry.id === releaseButton.dataset.phoneId);
+    if (!item || !phoneIsBusy(item)) return;
+    const shared = phoneUsageMode(item) === "shared";
+    const warning = shared
+      ? "确认立即结束这个账号对共享号码的占用？\n不论当前成功或失败，释放后同一个号码都可继续分配给下一个账号。"
+      : "确认释放这个未提交的旧占用？\n正在执行中的占用和已经点击 Google 保存的号码会被后端拒绝，不会误释放。";
+    if (!confirm(warning)) return;
+    releaseButton.disabled = true;
+    try {
+      const data = await api(`/api/phones/${item.id}/release-reservation`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expectedReservedAt: item.reservedAt }),
+      });
+      const index = phones.findIndex((entry) => entry.id === item.id);
+      if (index >= 0 && data.phone) phones[index] = data.phone;
+      renderPhones();
+      el("phoneImportStatus").textContent = shared
+        ? "共享号码已释放，可以继续绑定下一个账号"
+        : "旧占用已释放，这个号码可以继续使用";
+    } catch (err) {
+      el("phoneImportStatus").textContent = `释放失败：${err.message}`;
+      await loadPhones();
+    }
+    return;
+  }
   const button = event.target.closest(".phone-del");
   if (!button) return;
   const item = phones.find((entry) => entry.id === button.dataset.phoneId);

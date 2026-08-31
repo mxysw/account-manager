@@ -21,6 +21,19 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
+  // 自动化 jobs 只存在内存中；新进程不可能继续上一进程留下的 active lease。
+  // 共享号码按产品语义在任务结束后总是可复用；一号一绑仍只恢复确定未提交的 reserved。
+  try {
+    const recovered = phones.recoverUnsubmittedReservations({
+      allowFresh: true,
+      reason: "服务重启后自动恢复手机号池可用状态",
+    });
+    if (recovered.released) {
+      console.log(`手机号池：已恢复 ${recovered.released} 个遗留占用（未用 ${recovered.toUnused}，已用 ${recovered.toUsed}）`);
+    }
+  } catch (err) {
+    console.error("[phone-recovery]", err && err.message ? err.message : err);
+  }
   console.log(`Account Manager: http://${HOST}:${PORT}`);
 });
 
