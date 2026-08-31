@@ -2439,6 +2439,26 @@ function phoneStatusPresentation(item) {
   };
 }
 
+function phoneHasBindings(item) {
+  return !!(item && (phoneBindingCount(item) > 0 || item.status === "used"));
+}
+
+function phoneIsBusy(item) {
+  return !!(item && (item.status === "reserved" || item.status === "pending"));
+}
+
+function phoneStatusOptionText(item, status, statusView) {
+  const isSharedBound = phoneUsageMode(item) === "shared" && phoneHasBindings(item);
+  if (isSharedBound && status === "disabled") {
+    return status === item.status ? "已停用复用" : "停用复用";
+  }
+  if (isSharedBound && status === "used" && item.status === "disabled") {
+    return "恢复共享可用";
+  }
+  if (status === item.status) return statusView.text;
+  return PHONE_STATUS_TEXT[status] || status;
+}
+
 function readPhoneRunMode() {
   const select = el("phoneRunMode");
   return normalizePhoneUsageMode(select && select.value);
@@ -2467,8 +2487,7 @@ function filteredPhones() {
 }
 
 function phoneDeleteProtected(item) {
-  return !!(item && (phoneBindingCount(item) > 0
-    || item.status === "reserved" || item.status === "pending" || item.status === "used"));
+  return phoneIsBusy(item);
 }
 
 function renderPhones() {
@@ -2480,7 +2499,7 @@ function renderPhones() {
       ? item.allowedStatuses : (PHONE_FALLBACK_MANUAL_STATUSES[item.status] || [item.status]);
     const statusView = phoneStatusPresentation(item);
     const options = allowed.map((status) => {
-      const text = status === item.status ? statusView.text : (PHONE_STATUS_TEXT[status] || status);
+      const text = phoneStatusOptionText(item, status, statusView);
       return `<option value="${status}"${status === item.status ? " selected" : ""}>${escapeHtml(text)}</option>`;
     }).join("");
     const mode = phoneUsageMode(item);
@@ -2491,7 +2510,8 @@ function renderPhones() {
     const statusDetail = item.lastError ? `<div class="muted" title="${escapeHtml(item.lastError)}">${escapeHtml(item.lastError)}</div>` : "";
     const masked = item.maskedNumber || `•••• ${escapeHtml(item.last4 || "")}`;
     const deleteProtected = phoneDeleteProtected(item);
-    return `<tr data-id="${item.id}">
+    const hasBindings = phoneHasBindings(item);
+    return `<tr data-id="${item.id}"${hasBindings ? ' class="phone-bound"' : ""}>
       <td class="col-check"><input type="checkbox" data-phone-id="${item.id}"${phoneSelected.has(item.id) ? " checked" : ""}${deleteProtected ? " disabled" : ""} /></td>
       <td class="muted">${index + 1}</td>
       <td><span class="mono" title="手机号已脱敏">${escapeHtml(masked)}</span></td>
@@ -2500,7 +2520,7 @@ function renderPhones() {
       <td class="muted phone-binding-count" title="已成功绑定的账号数量">${bindingCount}</td>
       <td class="muted nowrap" title="${escapeHtml(item.usedBy || "")}">${escapeHtml(item.usedBy || "")}</td>
       <td><span class="ec" contenteditable="true" data-phone-id="${item.id}" data-phone-field="notes">${escapeHtml(item.notes || "")}</span>${statusDetail}</td>
-      <td><button class="ghost danger slim phone-del" data-phone-id="${item.id}"${deleteProtected ? ' disabled title="该状态受保护，不能删除"' : ""}>删</button></td>
+      <td><button class="ghost danger slim phone-del${hasBindings ? " phone-del-bound" : ""}" data-phone-id="${item.id}"${deleteProtected ? ' disabled title="号码正在占用或等待确认，暂不能删除"' : hasBindings ? ' title="删除本地记录（不会从 Google 解绑）"' : ""}>删</button></td>
     </tr>`;
   }).join("");
   el("phoneTableWrap").hidden = phones.length === 0;
@@ -2566,13 +2586,22 @@ el("phoneImportBtn").addEventListener("click", async () => {
 
 el("phoneDeleteBtn").addEventListener("click", async () => {
   if (!phoneSelected.size) { el("phoneImportStatus").textContent = "先勾选要删除的手机号"; return; }
-  if (!confirm(`确认删除选中的 ${phoneSelected.size} 个手机号？占用中、待生效/待确认和已使用号码都会被保护。`)) return;
+  const selectedItems = phones.filter((item) => phoneSelected.has(item.id));
+  const boundCount = selectedItems.filter(phoneHasBindings).length;
+  const warning = boundCount
+    ? `确认删除选中的 ${selectedItems.length} 个手机号？\n其中 ${boundCount} 个已有绑定记录。只会删除本地手机号池记录，不会从 Google 账号解绑手机号。`
+    : `确认删除选中的 ${selectedItems.length} 个手机号？`;
+  if (!confirm(warning)) return;
   try {
     const data = await api("/api/phones/delete", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: [...phoneSelected] }),
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids: [...phoneSelected], ...(boundCount ? { forceBound: true } : {}) }),
     });
     phones = data.phones || [];
     phoneSelected = new Set();
+    el("phoneImportStatus").textContent = boundCount
+      ? `已删除 ${selectedItems.length} 条本地记录；Google 账号中的手机号未解绑`
+      : `已删除 ${selectedItems.length} 个手机号`;
     renderPhones();
   } catch (err) {
     el("phoneImportStatus").textContent = err.message;
@@ -2636,13 +2665,23 @@ el("phoneRows").addEventListener("keydown", (event) => {
 el("phoneRows").addEventListener("click", async (event) => {
   const button = event.target.closest(".phone-del");
   if (!button) return;
-  if (!confirm("删除这个手机号？占用中、待生效/待确认和已使用号码不能删除。")) return;
+  const item = phones.find((entry) => entry.id === button.dataset.phoneId);
+  if (!item || phoneIsBusy(item)) return;
+  const hasBindings = phoneHasBindings(item);
+  const warning = hasBindings
+    ? "确认删除这个已绑定手机号的本地记录？\n这不会从 Google 账号解绑手机号。"
+    : "确认删除这个手机号？";
+  if (!confirm(warning)) return;
   try {
     await api("/api/phones/delete", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: [button.dataset.phoneId] }),
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids: [button.dataset.phoneId], ...(hasBindings ? { forceBound: true } : {}) }),
     });
     phoneSelected.delete(button.dataset.phoneId);
     await loadPhones();
+    el("phoneImportStatus").textContent = hasBindings
+      ? "已删除本地记录；Google 账号中的手机号未解绑"
+      : "已删除手机号";
   } catch (err) {
     el("phoneImportStatus").textContent = err.message;
   }

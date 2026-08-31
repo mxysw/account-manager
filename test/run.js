@@ -1207,6 +1207,27 @@ check("共享号码可依次绑定多个账号，同时始终只有一个 active
   assert.strictEqual(dto.status, "used", "已有绑定历史时，本次失败不能抹掉既有绑定");
   assert.strictEqual(dto.bindingCount, initialCount + 2);
   assert.strictEqual(dto.available, true);
+  assert.deepStrictEqual(dto.allowedStatuses, ["used", "disabled"]);
+
+  const lastOwner = dto.usedBy;
+  phonePool.update(shared.id, { status: "disabled" });
+  dto = phonePool.toPublic(phonePool.getById(shared.id));
+  assert.strictEqual(dto.status, "disabled");
+  assert.strictEqual(dto.available, false, "停用后共享号码不能继续被领取");
+  assert.strictEqual(dto.bindingCount, initialCount + 2, "停用不能清空既有绑定历史");
+  assert.strictEqual(dto.usedBy, lastOwner, "停用后仍应保留最近绑定账号用于管理");
+  assert.deepStrictEqual(dto.allowedStatuses, ["disabled", "used"]);
+  assert.strictEqual(
+    phonePool.claimForAccount({ id: "shared-disabled-miss", email: "shared-disabled-miss@example.com" }, { mode: "shared" }),
+    null,
+    "停用中的共享号码不能分配给新账号",
+  );
+  assert.throws(() => phonePool.update(shared.id, { status: "unused" }), (err) => err && err.code === "PHONE_STATE_CONFLICT");
+  assert.throws(() => phonePool.update(shared.id, { status: "failed" }), (err) => err && err.code === "PHONE_STATE_CONFLICT");
+  phonePool.update(shared.id, { status: "used" });
+  dto = phonePool.toPublic(phonePool.getById(shared.id));
+  assert.strictEqual(dto.available, true, "恢复后共享号码应重新可分配");
+  assert.strictEqual(dto.bindingCount, initialCount + 2);
   assert.throws(
     () => phonePool.update(shared.id, { usageMode: "exclusive" }),
     (err) => err && err.code === "PHONE_STATE_CONFLICT",
@@ -1293,6 +1314,33 @@ check("未占用号码可在共享与一号一绑之间切换，模式会限制�
   assert.deepStrictEqual(phonePool.remove([item.id]).blocked, [], "没有 active lease 或绑定历史时仍可删除");
 });
 
+check("已绑号码可明确强制删除本地记录，但 active lease 永远受保护", () => {
+  const boundNumber = "+12025550138";
+  phonePool.importText(boundNumber, { usageMode: "exclusive" });
+  const bound = phonePool.list().find((item) => item.number === boundNumber);
+  phonePool.confirmManualUsed(bound.id, { id: "force-bound-account", email: "force-bound@example.com" });
+  assert.deepStrictEqual(phonePool.remove([bound.id]).blocked, [bound.id], "未明确强删时仍应保护绑定历史");
+  assert.throws(() => phonePool.remove([bound.id], { forceBound: "true" }), /forceBound 必须是布尔值/);
+  const forced = phonePool.remove([bound.id], { forceBound: true });
+  assert.strictEqual(forced.removed, 1, "明确 forceBound 后应只删除本地记录");
+  assert.strictEqual(phonePool.getById(bound.id), null);
+
+  const activeNumber = "+12025550139";
+  phonePool.importText(activeNumber, { usageMode: "exclusive" });
+  const active = phonePool.claimForAccount(
+    { id: "force-active-account", email: "force-active@example.com" },
+    { mode: "exclusive" },
+  );
+  assert.strictEqual(active.item.number, activeNumber);
+  assert.deepStrictEqual(
+    phonePool.remove([active.item.id], { forceBound: true }).blocked,
+    [active.item.id],
+    "即使明确强删，进行中的号码也不能删除",
+  );
+  phonePool.release(active.item.id, active.leaseId, "测试收尾");
+  assert.strictEqual(phonePool.remove([active.item.id], { forceBound: true }).removed, 1);
+});
+
 check("手机号池 public DTO 不泄露完整号码、raw、lease 或内部账号 id", () => {
   const internal = phonePool.list()[0];
   phonePool.update(internal.id, { notes: `备用联系方式 ${internal.number}` });
@@ -1305,7 +1353,7 @@ check("手机号池 public DTO 不泄露完整号码、raw、lease 或内部账�
   assert.ok(Number.isInteger(dto.bindingCount) && dto.bindingCount >= 0);
   assert.strictEqual(typeof dto.available, "boolean");
   assert.ok(!JSON.stringify(dto).includes(internal.number), "public DTO 不应以其它字段回显完整号码");
-  if (dto.status === "used") assert.deepStrictEqual(dto.allowedStatuses, ["used"]);
+  if (dto.status === "used" && dto.bindingCount > 0) assert.deepStrictEqual(dto.allowedStatuses, ["used", "disabled"]);
 });
 
 check("手机号池任务轮询不会打断备注/状态编辑", () => {
@@ -1347,7 +1395,13 @@ check("手机号 UI/文档以直接添加和稍后生效为默认，验证码仅
   assert.match(appSource, /phoneMode:\s*readPhoneRunMode\(\)/, "自动化任务必须携带本次领取模式");
   assert.match(appSource, /共享可用（已绑 \$\{count\}）/);
   assert.match(appSource, /data-phone-mode/);
+  assert.match(appSource, /function phoneIsBusy[\s\S]*reserved[\s\S]*pending/);
+  assert.match(appSource, /只会删除本地手机号池记录，不会从 Google 账号解绑手机号/);
+  assert.match(appSource, /forceBound:\s*true/, "删除已绑记录必须向后端显式声明强制本地删除");
+  assert.match(appSource, /停用复用/);
+  assert.match(appSource, /恢复共享可用/);
   assert.match(readmeSource, /本地手机号池不限制共享复用次数/);
+  assert.match(readmeSource, /只删除本地手机号池记录，不会从 Google 账号中解绑手机号/);
 });
 
 check("添加两步验证手机号已注册为高风险写操作且必须独占、单并发", () => {
@@ -1654,6 +1708,21 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: [internal.id] }),
       });
       assert.strictEqual(res.status, 409, "active 删除必须返回 409");
+      res = await jsonRequest("/api/phones/delete", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ids: [internal.id], forceBound: true }),
+      });
+      assert.strictEqual(res.status, 409, "active 即使 forceBound=true 也必须受保护");
+      res = await jsonRequest("/api/phones/delete", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ids: [internal.id], forceBound: "true" }),
+      });
+      assert.strictEqual(res.status, 400, "forceBound 必须严格为布尔值");
+      res = await jsonRequest("/api/phones/delete", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ids: [internal.id], unexpected: true }),
+      });
+      assert.strictEqual(res.status, 400, "删除 API 必须拒绝未知字段");
 
       res = await jsonRequest(`/api/phones/${internal.id}`, {
         method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "failed" }),
@@ -1670,10 +1739,34 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
       });
       assert.strictEqual(res.status, 200, "允许用户把外部已消耗号码永久标成 used");
       phonePool.confirmManualUsed(internal.id, { id: "api-account", email: "api@example.com" });
+      res = await jsonRequest(`/api/phones/${internal.id}`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "disabled" }),
+      });
+      assert.strictEqual(res.status, 200, "已绑号码应允许停用");
+      body = await res.json();
+      assert.strictEqual(body.phone.status, "disabled");
+      assert.strictEqual(body.phone.available, false);
+      assert.deepStrictEqual(body.phone.allowedStatuses, ["disabled", "used"]);
+      res = await jsonRequest(`/api/phones/${internal.id}`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "unused" }),
+      });
+      assert.strictEqual(res.status, 409, "停用不能清空既有绑定历史");
+      res = await jsonRequest(`/api/phones/${internal.id}`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: "used" }),
+      });
+      assert.strictEqual(res.status, 200, "停用后应允许恢复已用/共享可用状态");
       res = await jsonRequest("/api/phones/delete", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ids: [internal.id] }),
       });
       assert.strictEqual(res.status, 409, "used 删除必须返回 409");
+      res = await jsonRequest("/api/phones/delete", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ids: [internal.id], forceBound: true }),
+      });
+      assert.strictEqual(res.status, 200, "明确 forceBound=true 后应允许删除已绑本地记录");
+      body = await res.json();
+      assert.strictEqual(body.removed, 1);
+      assert.strictEqual(phonePool.getById(internal.id), null);
 
       res = await jsonRequest("/api/phones");
       assert.strictEqual(res.status, 200);

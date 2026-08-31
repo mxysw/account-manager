@@ -290,13 +290,45 @@ const ROUTES = [
 
   ["POST", /^\/api\/phones\/delete$/, async (req) => {
     const body = await readBody(req);
-    const ids = Array.isArray(body.ids) ? body.ids : (body.id ? [body.id] : []);
-    if (!ids.length) return { status: 400, body: { error: "请提供要删除的手机号 id" } };
-    const r = phones.remove(ids);
-    if (r.blocked && r.blocked.length) {
-      return { status: 409, body: { error: "占用中、待短信验证码或已使用的号码不能删除；可将进行中的号码显式标记为失败/停用", ...r, phones: phones.publicList() } };
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return { status: 400, body: { error: "请求体必须是对象" } };
     }
-    return { status: 200, body: { ...r, phones: phones.publicList() } };
+    const keys = Object.keys(body);
+    if (keys.some((key) => !["id", "ids", "forceBound"].includes(key))) {
+      return { status: 400, body: { error: "请求体只支持 id、ids 和 forceBound" } };
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "id") && Object.prototype.hasOwnProperty.call(body, "ids")) {
+      return { status: 400, body: { error: "id 和 ids 只能提供一个" } };
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "forceBound") && typeof body.forceBound !== "boolean") {
+      return { status: 400, body: { error: "forceBound 必须是布尔值" } };
+    }
+    let ids;
+    if (Object.prototype.hasOwnProperty.call(body, "ids")) {
+      if (!Array.isArray(body.ids)) return { status: 400, body: { error: "ids 必须是手机号 id 数组" } };
+      ids = body.ids;
+    } else if (Object.prototype.hasOwnProperty.call(body, "id")) {
+      ids = [body.id];
+    } else {
+      ids = [];
+    }
+    if (!ids.length) return { status: 400, body: { error: "请提供要删除的手机号 id" } };
+    if (ids.some((id) => typeof id !== "string" || !id.trim())) {
+      return { status: 400, body: { error: "手机号 id 必须是非空字符串" } };
+    }
+    try {
+      const forceBound = body.forceBound === true;
+      const r = phones.remove(ids, { forceBound });
+      if (r.blocked && r.blocked.length) {
+        const error = forceBound
+          ? "占用中或待确认的号码不能删除；请先等待当前任务结束。本操作只删除本地记录，不会改动 Google 绑定"
+          : "已绑定、已使用、占用中或待确认的号码受保护；如只需移除本地已绑定记录，请明确使用 forceBound=true（不会改动 Google 绑定）";
+        return { status: 409, body: { error, ...r, phones: phones.publicList() } };
+      }
+      return { status: 200, body: { ...r, phones: phones.publicList() } };
+    } catch (err) {
+      return { status: 400, body: { error: err.message } };
+    }
   }],
 
   ["POST", /^\/api\/phones\/([^/]+)\/confirm-used$/, async (req, m) => {

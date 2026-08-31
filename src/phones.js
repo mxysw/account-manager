@@ -19,10 +19,10 @@ const MANUAL_STATUS_TRANSITIONS = {
   // 已经向 Google 发出短信；人工改状态会让 lease 失效并埋下重复分配风险。
   reserved: new Set(["reserved"]),
   pending: new Set(["pending"]),
-  // 已使用号码是永久占用记录，不能再改回可分配状态。
-  used: new Set(["used"]),
+  // 有成功绑定历史的号码可人工停用；恢复时仍保留绑定历史，不会变成“未用”。
+  used: new Set(["used", "disabled"]),
   failed: new Set(["failed", "unused", "disabled"]),
-  disabled: new Set(["disabled", "unused", "failed"]),
+  disabled: new Set(["disabled", "unused", "failed", "used"]),
 };
 
 function nowIso() {
@@ -257,9 +257,20 @@ function isAvailable(item, requestedMode = "") {
 }
 
 function manualStatusesFor(item) {
+  // 已经绑定过的号码只能在“已用”和“停用”之间切换。这样既能暂时阻止
+  // 共享分配，也不会把 Google 侧已经存在的绑定伪装成未用/失败。
+  if (bindingCount(item) > 0) {
+    if (item.status === "used") return ["used", "disabled"];
+    if (item.status === "disabled") return ["disabled", "used"];
+  }
   const allowed = MANUAL_STATUS_TRANSITIONS[item && item.status];
   if (!allowed) return [];
-  return [...allowed].filter((status) => status !== "unused" || bindingCount(item) === 0);
+  return [...allowed].filter((status) => {
+    if (status === "unused" && bindingCount(item) > 0) return false;
+    if (status === "used" && item.status === "disabled" && bindingCount(item) === 0) return false;
+    if (status === "disabled" && item.status === "used" && bindingCount(item) === 0) return false;
+    return true;
+  });
 }
 
 /** 仅供本地 HTTP API/UI 使用；自动化模块继续通过 list/getById 读取完整号码。 */
@@ -609,16 +620,16 @@ function update(id, patch) {
   if (Object.prototype.hasOwnProperty.call(next, "status")) {
     desiredStatus = String(next.status);
     if (!STATUSES.includes(desiredStatus)) throw new Error(`不支持的手机号状态：${desiredStatus}`);
-    const allowed = MANUAL_STATUS_TRANSITIONS[item.status];
-    if (!allowed || !allowed.has(desiredStatus)) {
+    const allowed = manualStatusesFor(item);
+    if (!allowed.includes(desiredStatus)) {
       if ((desiredStatus === "reserved" || desiredStatus === "pending") && !ACTIVE_STATUSES.has(item.status)) {
         throw stateConflict("占用/待确认状态只能由添加手机号任务创建");
       }
       if (ACTIVE_STATUSES.has(item.status)) {
         throw stateConflict("手机号有进行中的任务，只能由持有 lease 的自动化动作推进");
       }
-      if (item.status === "used") {
-        throw stateConflict("已有成功绑定历史的号码不能手工改为其它状态");
+      if (bindingCount(item) > 0) {
+        throw stateConflict("已有成功绑定历史的号码只能在已用和停用之间切换");
       }
       throw stateConflict(`不允许把手机号状态从 ${item.status} 改为 ${desiredStatus}`);
     }
@@ -657,13 +668,35 @@ function update(id, patch) {
   return item;
 }
 
-/** 有 active lease、used 状态或任何成功 binding 都拒绝删除，避免误删外部已使用记录。 */
-function remove(ids) {
+/**
+ * 默认保护 active lease、used 状态和成功 binding。
+ * forceBound=true 只代表用户明确删除本地记录，不会也不能删除 Google 侧绑定；
+ * reserved/pending 在任何情况下都不能删除，避免任务继续运行后写回一条已删除记录。
+ */
+function remove(ids, options = {}) {
+  if (options == null || typeof options !== "object" || Array.isArray(options)) {
+    throw new Error("删除选项必须是对象");
+  }
+  const optionKeys = Object.keys(options);
+  if (optionKeys.some((key) => key !== "forceBound")) {
+    throw new Error("删除选项只支持 forceBound");
+  }
+  if (Object.prototype.hasOwnProperty.call(options, "forceBound") && typeof options.forceBound !== "boolean") {
+    throw new Error("forceBound 必须是布尔值");
+  }
+  const forceBound = options.forceBound === true;
+  const rawIds = Array.isArray(ids) ? ids : [ids];
+  const normalizedIds = rawIds.map((id) => {
+    if (typeof id !== "string" || !id.trim()) throw new Error("手机号 id 必须是非空字符串");
+    return id.trim();
+  });
   const data = db.get();
   const items = list();
-  const set = new Set(Array.isArray(ids) ? ids : [ids]);
-  const blocked = items.filter((item) => set.has(item.id)
-    && (ACTIVE_STATUSES.has(item.status) || item.status === "used" || bindingCount(item) > 0));
+  const set = new Set(normalizedIds);
+  const blocked = items.filter((item) => set.has(item.id) && (
+    ACTIVE_STATUSES.has(item.status)
+    || (!forceBound && (item.status === "used" || bindingCount(item) > 0))
+  ));
   if (blocked.length) return { removed: 0, blocked: blocked.map((item) => item.id), total: items.length };
   const before = items.length;
   data.phones = items.filter((item) => !set.has(item.id));
