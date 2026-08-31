@@ -394,7 +394,7 @@ function passwordCheckBadge(a) {
 // 状态列对应的检测项名称，用于下拉的悬停提示（滚动时即使表头看不见也能分清是哪项）。
 const STATUS_FIELD_LABEL = {
   login: "登录", gmail: "Gmail", youtube: "YouTube", payment: "支付", family: "家庭组",
-  gemini: "Gemini", gpt: "GPT", device: "设备清理", age: "年龄验证", restrict: "服务限制", phone: "验证电话",
+  gemini: "Gemini", gpt: "GPT", device: "设备清理", age: "年龄验证", restrict: "服务限制", phone: "两步验证手机号",
 };
 
 function statusCell(a, key) {
@@ -420,6 +420,30 @@ function editCell(a, field, value, opts = {}) {
   return `<span class="${cls}" contenteditable="true" data-id="${a.id}" data-field="${field}"${title}>${display}</span>`;
 }
 
+function twoStepPhoneBadgeText(phone) {
+  if (phone.origin === "added") return "本次添加";
+  if (phone.origin === "preexisting") return "原本已有";
+  if (phone.origin === "manual") return "手动确认";
+  return "已绑定";
+}
+
+// 列表只拿脱敏号码；完整号码不进入表格 DOM，点击时才按账号与绑定 id 向后端取回并复制。
+function twoStepPhonesHtml(a) {
+  const items = Array.isArray(a.twoStepPhones) ? a.twoStepPhones : [];
+  if (!items.length) return "";
+  const rows = items.map((phone) => {
+    const stateBits = [twoStepPhoneBadgeText(phone)];
+    if (phone.verification === "not_requested") stateBits.push("免短信验证");
+    if (phone.verification === "sms_completed") stateBits.push("短信已验证");
+    if (phone.activation === "deferred") stateBits.push("待生效");
+    return `<div class="acc-phone-row">
+      <button class="acc-phone-number row-copyphone" data-id="${escapeHtml(a.id)}" data-phone-id="${escapeHtml(phone.phoneId)}" title="点击复制完整手机号">${escapeHtml(phone.maskedNumber || `••••${phone.last4 || ""}`)}</button>
+      <span class="acc-phone-state phone-origin-${escapeHtml(phone.origin || "unknown")}">${escapeHtml(stateBits.join(" · "))}</span>
+    </div>`;
+  }).join("");
+  return `<div class="acc-phone-block"><div class="acc-phone-label">两步验证手机号</div>${rows}</div>`;
+}
+
 // 公共「完整列」行模板：检测系统 / 出售管理 / 养号管理三个视图共用同一份模板渲染每一行，
 // 保证三张表列完全一致，且行内交互（取码 / 状态下拉 / 行内编辑 / 复制 / 删除 / 勾选）都在三视图生效。
 // i 为各视图各自的序号（从 0 起），故行号按各自筛选结果计。
@@ -435,6 +459,7 @@ function accountRowHtml(a, i) {
           <button class="ghost slim row-copy" data-id="${a.id}" title="复制该账号（异常账号末尾会追加具体原因，例如：----人机验证）">复制</button>
           <button class="ghost slim row-sell" data-id="${a.id}" title="导出该账号交付文本并标记为「已售」（已售号不可重复出库）">出库</button>
         </div>
+        ${twoStepPhonesHtml(a)}
         <div class="acc-email" data-id="${a.id}" title="双击复制邮箱">${escapeHtml(a.email)}</div>
         <div class="acc-pass">${editCell(a, "password", a.password, { mono: true })}<button class="ghost slim row-copypass" data-id="${a.id}" title="复制该账号密码">复制密码</button>${passwordCheckBadge(a)}</div>
       </td>
@@ -831,6 +856,18 @@ async function onRowClick(e) {
     // 释放按钮焦点，让轮询软刷新可以在首轮就重绘这一行。
     runBtn.blur();
     startJob([runBtn.dataset.id]);
+    return;
+  }
+  const copyPhoneBtn = e.target.closest(".row-copyphone");
+  if (copyPhoneBtn) {
+    try {
+      const accountId = encodeURIComponent(copyPhoneBtn.dataset.id || "");
+      const phoneId = encodeURIComponent(copyPhoneBtn.dataset.phoneId || "");
+      const data = await api(`/api/accounts/${accountId}/two-step-phones/${phoneId}`);
+      copyValue(copyPhoneBtn, data.number, "两步验证手机号");
+    } catch (err) {
+      toast(`复制手机号失败：${err.message}`);
+    }
     return;
   }
   // 单行「复制密码」：只复制该账号密码。

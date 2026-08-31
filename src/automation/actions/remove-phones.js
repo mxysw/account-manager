@@ -24,6 +24,7 @@
 
 const login = require("./login");
 const change2fa = require("./change-2fa");
+const defaultPhonePool = require("../../phones");
 
 const {
   sleep, parseLoc, visibleFirst, clickText, bodyText, withTimeout,
@@ -250,6 +251,7 @@ function toPhoneFailure(terminalResult) {
 
 async function removePhones(page, account, ctx) {
   const emit = ctx && ctx.emit ? ctx.emit : () => {};
+  const phonePool = ctx && ctx.phonePool ? ctx.phonePool : defaultPhonePool;
   const counters = { reauth: 0, unknown: 0 };
   const deadline = Date.now() + ACTION_TIMEOUT_MS;
 
@@ -257,7 +259,7 @@ async function removePhones(page, account, ctx) {
   emit("open_phones");
 
   const configs = [
-    { key: "twosv", urls: TWOSV_URLS, label: "2步验证电话", section: SECTION_RE.twosv },
+    { key: "twosv", urls: TWOSV_URLS, label: "两步验证手机号", section: SECTION_RE.twosv },
     { key: "recovery", urls: RECOVERY_URLS, label: "恢复电话", section: SECTION_RE.recovery },
   ];
 
@@ -275,13 +277,25 @@ async function removePhones(page, account, ctx) {
       return fail;
     }
     results[cfg.key] = r;
+    if (cfg.key === "twosv" && (r.kind === "removed" || r.kind === "none")
+      && typeof phonePool.markAccountBindingsRemoved === "function") {
+      try {
+        phonePool.markAccountBindingsRemoved(account);
+      } catch (err) {
+        return {
+          outcome: "need_verify",
+          statusPatch: { phone: "failed" },
+          detail: { phones: `Google 端已处理两步验证手机号，但本地绑定记录同步失败：${err.message}` },
+        };
+      }
+    }
   }
 
   return summarize(results);
 }
 
 function labelOf(key) {
-  return key === "twosv" ? "2步验证电话" : "恢复电话";
+  return key === "twosv" ? "两步验证手机号" : "恢复电话";
 }
 function zh(kind) {
   return kind === "removed" ? "已移除" : (kind === "none" ? "无" : "失败");

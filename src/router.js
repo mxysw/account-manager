@@ -44,6 +44,22 @@ function contentType(file) {
   return "application/octet-stream";
 }
 
+function publicAccount(account) {
+  if (!account) return account;
+  return {
+    ...account,
+    twoStepPhones: phones.publicBindingsForAccount(account),
+  };
+}
+
+function publicAccounts() {
+  const phoneItems = phones.list();
+  return accounts.list().map((account) => ({
+    ...account,
+    twoStepPhones: phones.publicBindingsForAccount(account, phoneItems),
+  }));
+}
+
 function serveStatic(res, pathname) {
   const file = path.resolve(PUBLIC_DIR, `.${pathname === "/" ? "/index.html" : pathname}`);
   if (file.startsWith(PUBLIC_DIR) && fs.existsSync(file) && fs.statSync(file).isFile()) {
@@ -60,7 +76,7 @@ const ROUTES = [
 
   ["GET", /^\/api\/accounts$/, () => ({
     status: 200,
-    body: { accounts: accounts.list(), statusFields: accounts.STATUS_FIELDS },
+    body: { accounts: publicAccounts(), statusFields: accounts.STATUS_FIELDS },
   })],
 
   ["POST", /^\/api\/accounts\/import$/, async (req) => {
@@ -239,6 +255,15 @@ const ROUTES = [
     return { status: 200, body: r };
   }],
 
+  ["GET", /^\/api\/accounts\/([^/]+)\/two-step-phones\/([^/]+)$/, (req, m) => {
+    const account = accounts.getById(m[1]);
+    if (!account) return { status: 404, body: { error: "账号不存在" } };
+    const number = phones.numberForAccount(m[2], account);
+    if (!number) return { status: 404, body: { error: "该账号没有这个有效手机号绑定" } };
+    // 完整号码只在用户明确点击脱敏号码时返回；账号列表和页面 DOM 始终只保存脱敏值。
+    return { status: 200, body: { number } };
+  }],
+
   ["PATCH", /^\/api\/accounts\/([^/]+)$/, async (req, m) => {
     const body = await readBody(req);
     const account = accounts.update(m[1], body);
@@ -345,10 +370,14 @@ const ROUTES = [
     const account = accounts.getById(accountId);
     if (!account) return { status: 404, body: { error: "账号不存在" } };
     try {
-      const phone = phones.confirmManualUsed(m[1], account);
+      const phone = phones.confirmManualUsed(m[1], account, {
+        origin: "added",
+        verification: "not_requested",
+        activation: "deferred",
+      });
       if (!phone) return { status: 404, body: { error: "手机号不存在" } };
       const updatedAccount = accounts.update(account.id, { status: { phone: "ok" } });
-      return { status: 200, body: { phone: phones.toPublic(phone), account: updatedAccount } };
+      return { status: 200, body: { phone: phones.toPublic(phone), account: publicAccount(updatedAccount) } };
     } catch (err) {
       return { status: err && err.code === "PHONE_STATE_CONFLICT" ? 409 : 400, body: { error: err.message } };
     }

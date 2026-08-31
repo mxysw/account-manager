@@ -576,6 +576,7 @@ async function drivePhoneFlow(page, account, number, ctx = {}, deps = {}) {
         submitted: true,
         explicitSuccess: true,
         activationDeferred: submitted && snap.delayedActivation && completionNoticeArmed,
+        verificationCompleted: sawCodePrompt,
       };
     }
 
@@ -776,9 +777,17 @@ async function addPhone(page, account, ctx = {}) {
     }
 
     if (result.explicitSuccess && (result.kind === "added" || result.kind === "already_present")) {
+      const activationDeferred = result.activationDeferred === true;
+      const bindingMeta = result.kind === "already_present"
+        ? { origin: "preexisting", verification: "unknown", activation: "ready" }
+        : {
+          origin: "added",
+          verification: result.verificationCompleted === true ? "sms_completed" : "not_requested",
+          activation: activationDeferred ? "deferred" : "ready",
+        };
       // 已是 used 的本地记录也必须先通过本次页面复核；复核后无需用空 lease 再 confirm。
       if (!claim.alreadyUsed) {
-        const used = pool.confirmUsed(item.id, leaseId);
+        const used = pool.confirmUsed(item.id, leaseId, bindingMeta);
         if (!used) {
           return finishSharedAttempt(
             pendingResult(masked, "Google 已显示添加成功，但本地手机号池占用已变化，请人工核对并标记"),
@@ -787,16 +796,17 @@ async function addPhone(page, account, ctx = {}) {
         }
       }
       emit("phone_added", { poolId: item.id, last4: item.number.slice(-4) });
-      const activationDeferred = result.activationDeferred === true;
       return {
         outcome: "ok",
         reasonCode: result.kind === "already_present" ? "phone_already_added"
           : (activationDeferred ? "phone_added_pending_activation" : "phone_added"),
         statusPatch: { phone: "ok" },
         detail: {
-          phoneAdd: activationDeferred
-            ? `两步验证手机号已添加；Google 提示需要等待一段时间后生效（${masked}）`
-            : `两步验证手机号已添加并在号码列表确认（${masked}）`,
+          phoneAdd: result.kind === "already_present"
+            ? `目标两步验证手机号原本已经存在（${masked}）`
+            : (activationDeferred
+              ? `两步验证手机号已添加，无需短信验证；Google 提示需要等待一段时间后生效（${masked}）`
+              : `两步验证手机号已添加并在号码列表确认（${masked}）`),
         },
         stop: true,
       };

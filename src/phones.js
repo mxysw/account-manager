@@ -12,6 +12,11 @@ const db = new JsonDB(DB_FILE, { phones: [] });
 // reserved=动作已领取但尚未提交；pending=号码已提交、等待 Google 确认/生效（或条件性短信码）。
 const STATUSES = ["unused", "reserved", "pending", "used", "failed", "disabled"];
 const USAGE_MODES = ["shared", "exclusive"];
+// 成功绑定证据跟随 binding 持久化。三态字段必须保留 unknown：旧数据没有
+// 足够证据判断号码是本次新增还是页面原本已有，也不能把“未记录”冒充 false。
+const BINDING_ORIGINS = ["added", "preexisting", "manual", "unknown"];
+const BINDING_VERIFICATIONS = ["not_requested", "sms_completed", "unknown"];
+const BINDING_ACTIVATIONS = ["deferred", "ready", "unknown"];
 const ACTIVE_STATUSES = new Set(["reserved", "pending"]);
 // 添加手机号动作的硬超时是 6 分钟。手动释放再留 4 分钟余量，避免用户在
 // 正常页面等待期间把仍可能继续点击的 lease 释放给下一个账号。
@@ -109,15 +114,48 @@ function sameAccount(left, right) {
     || (leftEmail && rightEmail && leftEmail === rightEmail));
 }
 
+function bindingEnum(value, allowed) {
+  const normalized = String(value == null ? "" : value).trim().toLowerCase();
+  return allowed.includes(normalized) ? normalized : "unknown";
+}
+
+function requireBindingEvidence(value) {
+  if (value == null) return { origin: "unknown", verification: "unknown", activation: "unknown" };
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error("手机号绑定证据必须是对象");
+  const allowedKeys = new Set(["origin", "verification", "activation"]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    throw new Error("手机号绑定证据包含不支持的字段");
+  }
+  const read = (key, allowed) => {
+    if (!Object.prototype.hasOwnProperty.call(value, key) || value[key] == null || value[key] === "") return "unknown";
+    const normalized = String(value[key]).trim().toLowerCase();
+    if (!allowed.includes(normalized)) throw new Error(`不支持的手机号绑定 ${key}：${normalized || "空"}`);
+    return normalized;
+  };
+  return {
+    origin: read("origin", BINDING_ORIGINS),
+    verification: read("verification", BINDING_VERIFICATIONS),
+    activation: read("activation", BINDING_ACTIVATIONS),
+  };
+}
+
 function normalizeBinding(value, fallbackUsedAt = "") {
   const accountId = String(value && (value.accountId || value.id) || "").trim();
   const email = String(value && value.email || "").trim();
   if (!accountId && !email) return null;
+  const removedAt = String(value && value.removedAt || "");
+  const active = value && typeof value.active === "boolean" ? value.active : !removedAt;
   return {
     accountId,
     email,
     usedAt: String(value && value.usedAt || fallbackUsedAt || ""),
     completedLeaseId: String(value && value.completedLeaseId || ""),
+    origin: bindingEnum(value && value.origin, BINDING_ORIGINS),
+    verification: bindingEnum(value && value.verification, BINDING_VERIFICATIONS),
+    activation: bindingEnum(value && value.activation, BINDING_ACTIVATIONS),
+    active,
+    // active 与 removedAt 互斥，避免旧/手改数据同时声称“仍绑定”和“已移除”。
+    removedAt: active ? "" : removedAt,
   };
 }
 
@@ -132,6 +170,17 @@ function mergeBindings(values, fallbackUsedAt = "") {
       if (!existing.email && binding.email) existing.email = binding.email;
       if (!existing.usedAt && binding.usedAt) existing.usedAt = binding.usedAt;
       if (!existing.completedLeaseId && binding.completedLeaseId) existing.completedLeaseId = binding.completedLeaseId;
+      // 首次可靠来源一旦写入就不能被后续“页面现在已存在”的观察覆盖。
+      if (existing.origin === "unknown" && binding.origin !== "unknown") existing.origin = binding.origin;
+      if (existing.verification === "unknown" && binding.verification !== "unknown") existing.verification = binding.verification;
+      if (existing.activation === "unknown" && binding.activation !== "unknown") existing.activation = binding.activation;
+      // 极少数旧数据可能有重复 binding；以较新的绑定/移除时间决定当前 active 状态。
+      const existingStateAt = Date.parse(existing.removedAt || existing.usedAt || "");
+      const bindingStateAt = Date.parse(binding.removedAt || binding.usedAt || "");
+      if (Number.isFinite(bindingStateAt) && (!Number.isFinite(existingStateAt) || bindingStateAt > existingStateAt)) {
+        existing.active = binding.active;
+        existing.removedAt = binding.active ? "" : binding.removedAt;
+      }
     } else {
       result.push(binding);
     }
@@ -321,6 +370,90 @@ function publicList() {
   return list().map(toPublic);
 }
 
+/**
+ * 账号表使用的安全联表结果：只返回仍 active 的成功绑定，不包含完整手机号、邮箱或 lease。
+ * 完整号码只能通过 numberForAccount 在再次校验账号绑定关系后取得。
+ */
+function publicBindingsForAccount(account, sourceItems = null) {
+  const key = accountKey(account);
+  if (!key.id && !key.email) return [];
+  const result = [];
+  // 批量账号列表可复用同一次已规范化的手机号快照，避免上千账号时反复迁移/扫描数据库。
+  const items = Array.isArray(sourceItems) ? sourceItems : list();
+  for (const item of items) {
+    for (const binding of Array.isArray(item.bindings) ? item.bindings : []) {
+      if (binding.active === false || !sameAccount(binding, { accountId: key.id, email: key.email })) continue;
+      result.push({
+        phoneId: item.id,
+        maskedNumber: maskNumber(item.number),
+        last4: String(item.number || "").slice(-4),
+        origin: bindingEnum(binding.origin, BINDING_ORIGINS),
+        verification: bindingEnum(binding.verification, BINDING_VERIFICATIONS),
+        activation: bindingEnum(binding.activation, BINDING_ACTIVATIONS),
+        boundAt: String(binding.usedAt || ""),
+      });
+    }
+  }
+  return result.sort((left, right) => (
+    String(right.boundAt || "").localeCompare(String(left.boundAt || ""))
+      || String(left.phoneId).localeCompare(String(right.phoneId))
+  ));
+}
+
+/** 仅当 phoneId 确实有该账号的 active binding 时返回完整号码；否则返回空串。 */
+function numberForAccount(phoneId, account) {
+  const key = accountKey(account);
+  if ((!key.id && !key.email) || !String(phoneId || "").trim()) return "";
+  const item = getById(String(phoneId).trim());
+  if (!item) return "";
+  const binding = (Array.isArray(item.bindings) ? item.bindings : []).find((entry) => (
+    entry.active !== false && sameAccount(entry, { accountId: key.id, email: key.email })
+  ));
+  return binding ? String(item.number || "") : "";
+}
+
+/**
+ * Google 已明确移除账号号码后，由动作调用此函数同步本地绑定关系。
+ * 先完整收集目标再修改；落盘失败会恢复内存快照，不产生“部分账号已移除”的状态。
+ */
+function markAccountBindingsRemoved(account) {
+  const key = accountKey(account);
+  if (!key.id && !key.email) throw new Error("移除手机号绑定需要账号 id 或邮箱");
+  const targets = [];
+  for (const item of list()) {
+    for (const binding of Array.isArray(item.bindings) ? item.bindings : []) {
+      if (binding.active === false || !sameAccount(binding, { accountId: key.id, email: key.email })) continue;
+      targets.push({ item, binding });
+    }
+  }
+  if (!targets.length) return { changed: 0 };
+
+  const removedAt = nowIso();
+  const snapshots = targets.map(({ item, binding }) => ({
+    item,
+    binding,
+    active: binding.active,
+    removedAt: binding.removedAt,
+    updatedAt: item.updatedAt,
+  }));
+  try {
+    for (const { item, binding } of targets) {
+      binding.active = false;
+      binding.removedAt = removedAt;
+      item.updatedAt = removedAt;
+    }
+    db.flushSync();
+  } catch (err) {
+    for (const snapshot of snapshots) {
+      snapshot.binding.active = snapshot.active;
+      snapshot.binding.removedAt = snapshot.removedAt;
+      snapshot.item.updatedAt = snapshot.updatedAt;
+    }
+    throw err;
+  }
+  return { changed: targets.length, removedAt };
+}
+
 function importText(text, options = {}) {
   const requested = typeof options === "string" ? options : (options && options.usageMode);
   const usageMode = requested == null || String(requested).trim() === ""
@@ -371,9 +504,11 @@ function activeBelongsTo(item, account) {
 
 function bindingForAccount(item, account) {
   const key = accountKey(account);
-  return (Array.isArray(item && item.bindings) ? item.bindings : []).find((binding) => sameAccount(
-    binding,
-    { accountId: key.id, email: key.email },
+  return (Array.isArray(item && item.bindings) ? item.bindings : []).find((binding) => (
+    binding.active !== false && sameAccount(
+      binding,
+      { accountId: key.id, email: key.email },
+    )
   )) || null;
 }
 
@@ -445,17 +580,36 @@ function validateLease(id, leaseId, allowed) {
   return item;
 }
 
-function appendBinding(item, account, usedAt = nowIso(), completedLeaseId = "") {
+function fillUnknownBindingEvidence(binding, evidence) {
+  let changed = false;
+  for (const key of ["origin", "verification", "activation"]) {
+    if (binding[key] === "unknown" && evidence[key] !== "unknown") {
+      binding[key] = evidence[key];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function appendBinding(item, account, usedAt = nowIso(), completedLeaseId = "", evidence = {}) {
   normalizeItem(item);
   const key = accountKey(account);
   if (!key.id && !key.email) throw new Error("成功绑定手机号需要账号 id 或邮箱");
-  let binding = bindingForAccount(item, account);
+  const normalizedEvidence = requireBindingEvidence(evidence);
+  // inactive 历史记录也要复用同一条 binding；重新确认后恢复 active，但首次来源不改写。
+  let binding = (Array.isArray(item && item.bindings) ? item.bindings : []).find((entry) => sameAccount(
+    entry,
+    { accountId: key.id, email: key.email },
+  )) || null;
   if (!binding) {
     binding = {
       accountId: key.id,
       email: String(account && account.email || "").trim(),
       usedAt,
       completedLeaseId: String(completedLeaseId || ""),
+      ...normalizedEvidence,
+      active: true,
+      removedAt: "",
     };
     item.bindings.push(binding);
   } else {
@@ -463,6 +617,9 @@ function appendBinding(item, account, usedAt = nowIso(), completedLeaseId = "") 
     if (!binding.email && key.email) binding.email = String(account && account.email || "").trim();
     if (!binding.usedAt) binding.usedAt = usedAt;
     if (!binding.completedLeaseId && completedLeaseId) binding.completedLeaseId = String(completedLeaseId);
+    fillUnknownBindingEvidence(binding, normalizedEvidence);
+    binding.active = true;
+    binding.removedAt = "";
   }
   return binding;
 }
@@ -520,7 +677,9 @@ function markPending(id, leaseId, reason = "手机号已提交，等待 Google �
   return item;
 }
 
-function confirmUsed(id, leaseId) {
+function confirmUsed(id, leaseId, evidence = {}) {
+  // 即使是幂等重放也先验证调用方传入的证据，避免偶发拼写错误被静默吞掉。
+  const normalizedEvidence = requireBindingEvidence(evidence);
   const existing = getById(id);
   // 两个只读观察者可能同时看到 Google 的明确成功。共享号码甚至可能已被下一账号
   // 领取，因此完成 token 同时保存在 binding 内；迟到确认只幂等返回，不能覆盖新 lease。
@@ -531,7 +690,7 @@ function confirmUsed(id, leaseId) {
   if (!item) return null;
   const now = nowIso();
   const account = { id: item.usedByAccountId, email: item.usedBy };
-  const binding = appendBinding(item, account, now, leaseId);
+  const binding = appendBinding(item, account, now, leaseId, normalizedEvidence);
   item.status = "used";
   item.lastError = "";
   item.completedLeaseId = leaseId;
@@ -549,7 +708,12 @@ function confirmUsed(id, leaseId) {
  * 允许未占用的 unused、同账号的 reserved/pending，以及同账号 used 幂等确认；
  * 其它状态或跨账号占用一律拒绝，避免把号码错误归属给另一个账号。
  */
-function confirmManualUsed(id, account) {
+function confirmManualUsed(id, account, evidence = {
+  origin: "manual",
+  verification: "unknown",
+  activation: "unknown",
+}) {
+  const normalizedEvidence = requireBindingEvidence(evidence);
   const item = getById(id);
   if (!item) return null;
   const key = accountKey(account);
@@ -563,6 +727,7 @@ function confirmManualUsed(id, account) {
   const existingBinding = bindingForAccount(item, account);
   if (!active && existingBinding) {
     // 同账号重复确认幂等，同时修复旧状态为 used。
+    fillUnknownBindingEvidence(existingBinding, normalizedEvidence);
     item.status = "used";
     item.usedByAccountId = existingBinding.accountId;
     item.usedBy = existingBinding.email;
@@ -582,7 +747,7 @@ function confirmManualUsed(id, account) {
 
   const now = nowIso();
   const completedLeaseId = active ? item.leaseId : "";
-  const binding = appendBinding(item, account, now, completedLeaseId);
+  const binding = appendBinding(item, account, now, completedLeaseId, normalizedEvidence);
   item.status = "used";
   item.usedByAccountId = binding.accountId;
   item.usedBy = binding.email;
@@ -861,12 +1026,18 @@ function flush() {
 module.exports = {
   STATUSES,
   USAGE_MODES,
+  BINDING_ORIGINS,
+  BINDING_VERIFICATIONS,
+  BINDING_ACTIVATIONS,
   MANUAL_RELEASE_MIN_AGE_MS,
   MANUAL_STATUS_TRANSITIONS,
   normalizeNumber,
   parseLine,
   list,
   publicList,
+  publicBindingsForAccount,
+  numberForAccount,
+  markAccountBindingsRemoved,
   toPublic,
   getById,
   importText,

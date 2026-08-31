@@ -1122,7 +1122,96 @@ check("手机号池旧记录安全迁移为一号一绑，并保留成功账号�
   assert.strictEqual(migrated.bindings.length, 1);
   assert.strictEqual(migrated.bindings[0].accountId, "legacy-account");
   assert.strictEqual(migrated.bindings[0].completedLeaseId, "legacy-completed-lease");
+  assert.strictEqual(migrated.bindings[0].origin, "unknown", "旧数据不能猜成页面原本已有或本次添加");
+  assert.strictEqual(migrated.bindings[0].verification, "unknown");
+  assert.strictEqual(migrated.bindings[0].activation, "unknown");
+  assert.strictEqual(migrated.bindings[0].active, true, "没有 removedAt 的旧绑定默认仍有效");
+  assert.strictEqual(migrated.bindings[0].removedAt, "");
   assert.strictEqual(phonePool.toPublic(migrated).available, false);
+});
+
+check("手机号 binding 持久化来源/验证/生效状态，安全联表只给脱敏号且首次来源不被覆盖", () => {
+  const data = phonePool._db.get();
+  const snapshot = JSON.parse(JSON.stringify(data.phones));
+  try {
+    data.phones = [];
+    phonePool._db.flushSync();
+
+    const account = { id: "binding-meta-account", email: "binding-meta@example.com" };
+    phonePool.importText("+12025550991", { usageMode: "shared" });
+    const claim = phonePool.claimForAccount(account, { mode: "shared" });
+    assert.ok(claim);
+    assert.ok(phonePool.confirmUsed(claim.item.id, claim.leaseId, {
+      origin: "added",
+      verification: "not_requested",
+      activation: "deferred",
+    }));
+
+    let binding = phonePool.getById(claim.item.id).bindings[0];
+    assert.strictEqual(binding.origin, "added");
+    assert.strictEqual(binding.verification, "not_requested");
+    assert.strictEqual(binding.activation, "deferred");
+    assert.strictEqual(binding.active, true);
+    assert.strictEqual(binding.removedAt, "");
+
+    const safe = phonePool.publicBindingsForAccount(account);
+    assert.deepStrictEqual(Object.keys(safe[0]).sort(), [
+      "activation", "boundAt", "last4", "maskedNumber", "origin", "phoneId", "verification",
+    ]);
+    assert.strictEqual(safe[0].maskedNumber, "+120 •••• 0991");
+    assert.strictEqual(safe[0].last4, "0991");
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(safe[0], "number"), false, "账号列表不得下发完整手机号");
+    assert.strictEqual(phonePool.numberForAccount(claim.item.id, account), "+12025550991");
+    assert.strictEqual(
+      phonePool.numberForAccount(claim.item.id, { id: "other-account", email: "other@example.com" }),
+      "",
+      "未绑定账号不能读取完整手机号",
+    );
+
+    // 同一完成 lease 的迟到观察即使声称 already-present，也不能改写首次 added 来源。
+    assert.ok(phonePool.confirmUsed(claim.item.id, claim.leaseId, {
+      origin: "preexisting",
+      verification: "sms_completed",
+      activation: "ready",
+    }));
+    binding = phonePool.getById(claim.item.id).bindings[0];
+    assert.strictEqual(binding.origin, "added");
+    assert.strictEqual(binding.verification, "not_requested");
+    assert.strictEqual(binding.activation, "deferred");
+
+    const removed = phonePool.markAccountBindingsRemoved(account);
+    assert.strictEqual(removed.changed, 1);
+    binding = phonePool.getById(claim.item.id).bindings[0];
+    assert.strictEqual(binding.active, false);
+    assert.ok(!Number.isNaN(Date.parse(binding.removedAt)));
+    assert.deepStrictEqual(phonePool.publicBindingsForAccount(account), [], "已移除绑定不能继续显示在账号行");
+    assert.strictEqual(phonePool.numberForAccount(claim.item.id, account), "", "已移除绑定不能再复制完整号");
+    assert.strictEqual(phonePool.markAccountBindingsRemoved(account).changed, 0, "重复移除应幂等");
+
+    const preexistingAccount = { id: "binding-preexisting-account", email: "binding-preexisting@example.com" };
+    const preexistingClaim = phonePool.claimForAccount(preexistingAccount, { mode: "shared" });
+    phonePool.confirmUsed(preexistingClaim.item.id, preexistingClaim.leaseId, {
+      origin: "preexisting",
+      verification: "sms_completed",
+      activation: "ready",
+    });
+    const preexisting = phonePool.publicBindingsForAccount(preexistingAccount)[0];
+    assert.strictEqual(preexisting.origin, "preexisting");
+    assert.strictEqual(preexisting.verification, "sms_completed");
+    assert.strictEqual(preexisting.activation, "ready");
+
+    phonePool.importText("+12025550992", { usageMode: "exclusive" });
+    const manualPhone = phonePool.list().find((item) => item.number === "+12025550992");
+    const manualAccount = { id: "binding-manual-account", email: "binding-manual@example.com" };
+    phonePool.confirmManualUsed(manualPhone.id, manualAccount);
+    const manual = phonePool.publicBindingsForAccount(manualAccount)[0];
+    assert.strictEqual(manual.origin, "manual");
+    assert.strictEqual(manual.verification, "unknown");
+    assert.strictEqual(manual.activation, "unknown");
+  } finally {
+    data.phones = snapshot;
+    phonePool._db.flushSync();
+  }
 });
 
 check("手机号池领取使用独占 lease；reserved 拒绝第二 runner，pending 仅只读复查", () => {
@@ -1591,6 +1680,15 @@ check("手机号 UI/文档以直接添加和稍后生效为默认，验证码仅
   assert.match(appSource, /恢复共享可用/);
   assert.match(readmeSource, /本地手机号池不限制共享复用次数/);
   assert.match(readmeSource, /只删除本地手机号池记录，不会从 Google 账号中解绑手机号/);
+  assert.match(appSource, /<div class="acc-phone-label">两步验证手机号<\/div>/, "账号信息上方应显示手机号分类标签");
+  assert.match(appSource, /phone\.maskedNumber/, "账号行只能渲染后端给的脱敏号码");
+  assert.match(appSource, /\/two-step-phones\/\$\{phoneId\}/, "点击脱敏号码时才应请求完整号");
+  const phoneRenderer = appSource.slice(
+    appSource.indexOf("function twoStepPhonesHtml"),
+    appSource.indexOf("function accountRowHtml"),
+  );
+  assert.ok(!phoneRenderer.includes("phone.number"), "完整手机号不得写进表格文本、title 或 data 属性");
+  assert.match(readmeSource, /本次添加.*原本已有.*免短信验证.*待生效/);
 });
 
 check("添加两步验证手机号已注册为高风险写操作且必须独占、单并发", () => {
@@ -2148,7 +2246,25 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
       assert.strictEqual(body.phone.usedBy, owner.email);
       assert.strictEqual(body.account.id, owner.id);
       assert.strictEqual(body.account.status.phone, "ok");
+      assert.strictEqual(body.account.twoStepPhones.length, 1);
+      assert.strictEqual(body.account.twoStepPhones[0].origin, "added");
+      assert.strictEqual(body.account.twoStepPhones[0].verification, "not_requested");
+      assert.strictEqual(body.account.twoStepPhones[0].activation, "deferred");
       assert.ok(!JSON.stringify(body.phone).includes(number), "响应手机号必须保持脱敏");
+      assert.ok(!JSON.stringify(body.account).includes(number), "账号响应不得夹带完整手机号");
+
+      res = await fetch(`${base}/api/accounts`);
+      assert.strictEqual(res.status, 200);
+      const accountListBody = await res.json();
+      const listedOwner = accountListBody.accounts.find((item) => item.id === owner.id);
+      assert.strictEqual(listedOwner.twoStepPhones[0].maskedNumber.endsWith("0135"), true);
+      assert.ok(!JSON.stringify(accountListBody).includes(number), "账号列表只能下发脱敏手机号");
+
+      res = await fetch(`${base}/api/accounts/${owner.id}/two-step-phones/${phone.id}`);
+      assert.strictEqual(res.status, 200, "已绑定账号点击时可取回完整号用于复制");
+      assert.strictEqual((await res.json()).number, number);
+      res = await fetch(`${base}/api/accounts/${other.id}/two-step-phones/${phone.id}`);
+      assert.strictEqual(res.status, 404, "未绑定账号不能越权读取完整号");
 
       const firstUsedAt = body.phone.usedAt;
       res = await post(phone.id, { accountId: owner.id });
@@ -2506,10 +2622,11 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
     assert.strictEqual(conditionalCode.kind, "code_required", "若 Google 确实显示短信码框，仍应交给用户处理，不能被延迟提示覆盖");
 
     const item = { id: "phone-deferred", number: "+12025550132", status: "reserved", submittedAt: "" };
+    let bindingEvidence = null;
     const pool = {
       claimForAccount: () => ({ item, leaseId: "lease-deferred", reused: false, alreadyUsed: false, readOnly: false }),
       markPending: () => { item.status = "pending"; item.submittedAt = new Date().toISOString(); return item; },
-      confirmUsed: () => { item.status = "used"; return item; },
+      confirmUsed: (_id, _lease, evidence) => { bindingEvidence = evidence; item.status = "used"; return item; },
       markFailed: () => null,
       release: () => null,
       getById: () => item,
@@ -2525,6 +2642,31 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
     assert.strictEqual(result.reasonCode, "phone_added_pending_activation");
     assert.strictEqual(result.statusPatch.phone, "ok");
     assert.match(result.detail.phoneAdd, /等待一段时间后生效/);
+    assert.deepStrictEqual(bindingEvidence, {
+      origin: "added", verification: "not_requested", activation: "deferred",
+    });
+  });
+
+  await checkAsync("添加手机号首次发现页面原本已有时记录来源，不冒充本次新增", async () => {
+    const item = { id: "phone-preexisting", number: "+12025550131", status: "reserved", submittedAt: "" };
+    let bindingEvidence = null;
+    const pool = {
+      claimForAccount: () => ({ item, leaseId: "lease-preexisting", reused: false, alreadyUsed: false, readOnly: false }),
+      confirmUsed: (_id, _lease, evidence) => { bindingEvidence = evidence; item.status = "used"; return item; },
+      markFailed: () => null,
+      release: () => null,
+      getById: () => item,
+    };
+    const result = await addPhone({}, { id: "preexisting-account", email: "preexisting@example.com" }, {
+      phonePool: pool,
+      drivePhoneFlow: async () => ({ kind: "already_present", submitted: false, explicitSuccess: true }),
+    });
+    assert.strictEqual(result.outcome, "ok");
+    assert.strictEqual(result.reasonCode, "phone_already_added");
+    assert.match(result.detail.phoneAdd, /原本已经存在/);
+    assert.deepStrictEqual(bindingEvidence, {
+      origin: "preexisting", verification: "unknown", activation: "ready",
+    });
   });
 
   await checkAsync("目标 URL 仍先检查 blocker，不因地址命中直接放行", async () => {
