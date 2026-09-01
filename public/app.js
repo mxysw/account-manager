@@ -421,10 +421,10 @@ function editCell(a, field, value, opts = {}) {
 }
 
 function twoStepPhoneBadgeText(phone) {
-  if (phone.origin === "added") return "本次添加";
-  if (phone.origin === "preexisting") return "原本已有";
-  if (phone.origin === "manual") return "手动确认";
-  return "已绑定";
+  if (phone.origin === "added") return "新增";
+  if (phone.origin === "preexisting") return "已有";
+  if (phone.origin === "manual") return "确认";
+  return "绑定";
 }
 
 // 列表只拿脱敏号码；完整号码不进入表格 DOM，点击时才按账号与绑定 id 向后端取回并复制。
@@ -433,15 +433,23 @@ function twoStepPhonesHtml(a) {
   if (!items.length) return "";
   const rows = items.map((phone) => {
     const stateBits = [twoStepPhoneBadgeText(phone)];
-    if (phone.verification === "not_requested") stateBits.push("免短信验证");
-    if (phone.verification === "sms_completed") stateBits.push("短信已验证");
+    if (phone.verification === "not_requested") stateBits.push("免验");
+    if (phone.verification === "sms_completed") stateBits.push("已验");
     if (phone.activation === "deferred") stateBits.push("待生效");
     return `<div class="acc-phone-row">
       <button class="acc-phone-number row-copyphone" data-id="${escapeHtml(a.id)}" data-phone-id="${escapeHtml(phone.phoneId)}" title="点击复制完整手机号">${escapeHtml(phone.maskedNumber || `••••${phone.last4 || ""}`)}</button>
-      <span class="acc-phone-state phone-origin-${escapeHtml(phone.origin || "unknown")}">${escapeHtml(stateBits.join(" · "))}</span>
+      <span class="acc-phone-state phone-origin-${escapeHtml(phone.origin || "unknown")}" title="${escapeHtml(stateBits.join(" / "))}">${escapeHtml(stateBits.join(" · "))}</span>
     </div>`;
   }).join("");
-  return `<div class="acc-phone-block"><div class="acc-phone-label">两步验证手机号</div>${rows}</div>`;
+  return rows;
+}
+
+function twoStepPhoneCellHtml(a) {
+  const phonesHtml = twoStepPhonesHtml(a);
+  return `<td class="two-step-phone-cell">
+    ${phonesHtml || '<span class="muted">—</span>'}
+    <div class="two-step-phone-status">${statusCell(a, "phone")}</div>
+  </td>`;
 }
 
 // 公共「完整列」行模板：检测系统 / 出售管理 / 养号管理三个视图共用同一份模板渲染每一行，
@@ -459,10 +467,10 @@ function accountRowHtml(a, i) {
           <button class="ghost slim row-copy" data-id="${a.id}" title="复制该账号（异常账号末尾会追加具体原因，例如：----人机验证）">复制</button>
           <button class="ghost slim row-sell" data-id="${a.id}" title="导出该账号交付文本并标记为「已售」（已售号不可重复出库）">出库</button>
         </div>
-        ${twoStepPhonesHtml(a)}
         <div class="acc-email" data-id="${a.id}" title="双击复制邮箱">${escapeHtml(a.email)}</div>
         <div class="acc-pass">${editCell(a, "password", a.password, { mono: true })}<button class="ghost slim row-copypass" data-id="${a.id}" title="复制该账号密码">复制密码</button>${passwordCheckBadge(a)}</div>
       </td>
+      ${twoStepPhoneCellHtml(a)}
       <td class="cat-cell">${categoryCell(a)}</td>
       <td>${editCell(a, "source", sourceOf(a))}</td>
       <td class="sale-cell">${saleCell(a)}</td>
@@ -482,7 +490,6 @@ function accountRowHtml(a, i) {
       <td>${statusCell(a, "device")}</td>
       <td>${statusCell(a, "age")}</td>
       <td>${statusCell(a, "restrict")}</td>
-      <td>${statusCell(a, "phone")}</td>
       <td>${editCell(a, "notes", a.notes)}</td>
       <td class="muted nowrap">${escapeHtml(fmtTime(a.updatedAt))}</td>
       <td class="nowrap">

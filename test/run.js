@@ -1680,7 +1680,10 @@ check("手机号 UI/文档以直接添加和稍后生效为默认，验证码仅
   assert.match(appSource, /恢复共享可用/);
   assert.match(readmeSource, /本地手机号池不限制共享复用次数/);
   assert.match(readmeSource, /只删除本地手机号池记录，不会从 Google 账号中解绑手机号/);
-  assert.match(appSource, /<div class="acc-phone-label">两步验证手机号<\/div>/, "账号信息上方应显示手机号分类标签");
+  assert.strictEqual((htmlSource.match(/<th>2FA 手机号<\/th>/g) || []).length, 8, "八个账号视图都应把手机号短列放在邮箱右侧");
+  assert.ok(!htmlSource.includes("<th>验证电话</th>"), "旧的远端验证电话列不应重复保留");
+  assert.match(appSource, /function twoStepPhoneBadgeText[\s\S]*return "新增"[\s\S]*return "已有"/);
+  assert.match(appSource, /stateBits\.push\("免验"\)[\s\S]*stateBits\.push\("待生效"\)/);
   assert.match(appSource, /phone\.maskedNumber/, "账号行只能渲染后端给的脱敏号码");
   assert.match(appSource, /\/two-step-phones\/\$\{phoneId\}/, "点击脱敏号码时才应请求完整号");
   const phoneRenderer = appSource.slice(
@@ -1688,7 +1691,7 @@ check("手机号 UI/文档以直接添加和稍后生效为默认，验证码仅
     appSource.indexOf("function accountRowHtml"),
   );
   assert.ok(!phoneRenderer.includes("phone.number"), "完整手机号不得写进表格文本、title 或 data 属性");
-  assert.match(readmeSource, /本次添加.*原本已有.*免短信验证.*待生效/);
+  assert.match(readmeSource, /新增.*已有.*绑定.*免验.*已验.*待生效/);
 });
 
 check("添加两步验证手机号已注册为高风险写操作且必须独占、单并发", () => {
