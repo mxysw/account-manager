@@ -1820,6 +1820,11 @@ check("添加两步验证手机号已注册为高风险写操作、动作独占�
   );
   assert.strictEqual(engine.helpers.shouldKeepTaskOpen(false, true), true);
   assert.strictEqual(engine.helpers.shouldKeepTaskOpen(false, false), false);
+  assert.strictEqual(
+    engine.helpers.shouldKeepTaskOpen(true, false),
+    true,
+    "普通登录触发人机时即使动作本身未请求接管，勾选保留窗口也必须生效",
+  );
 });
 
 check("添加手机号忽略全局保留窗口，普通成功后对应环境仍可继续下一个账号", () => {
@@ -3196,9 +3201,16 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
       drivePhoneFlow: async () => ({ kind: "blocked", submitted: false, detail: "Google 要求人机验证" }),
     });
     assert.strictEqual(blocked.outcome, "need_verify");
+    assert.strictEqual(blocked.reasonCode, "phone_add_blocked");
     assert.strictEqual(blocked.statusPatch.phone, "failed");
-    assert.strictEqual(blocked.keepOpen, false, "共享号码的人机验证失败也不能卡住整个批次");
-    assert.strictEqual(blocked.handoff, false);
+    assert.strictEqual(blocked.keepOpen, true, "内部登录触发人机时必须保留当前窗口供人工接管");
+    assert.strictEqual(blocked.handoff, true, "保留人机页时不能另开结果标签覆盖当前页面");
+    assert.match(blocked.detail.phoneAdd, /浏览器已保留供人工处理/);
+    assert.strictEqual(
+      engine.helpers.shouldKeepTaskOpen(false, blocked.keepOpen),
+      true,
+      "添加手机号即使忽略普通完成的全局保留，人机接管请求仍必须进入引擎保留分支",
+    );
     assert.strictEqual(blockerPool.calls.released, 1, "验证码尚未提交时号码应安全释放");
   });
 
