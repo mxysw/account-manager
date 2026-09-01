@@ -697,12 +697,16 @@ function tagLogin(r) {
   ]).has(reasonCode);
   const fieldPatch = { ...(r.fieldPatch || {}), lastLoginCheck };
   if (supersedesPasswordCheck) fieldPatch.lastPasswordCheck = null;
+  const manualHandoff = r.outcome === "need_verify" || needVerifyCodes.has(reasonCode);
   return {
     ...r,
     reasonCode,
     statusPatch: { ...(r.statusPatch || {}), login: s },
     fieldPatch,
     stop: r.outcome !== "ok",
+    // 这里只报告“当前页面适合人工接管”；是否真的保留由任务的独立策略决定。
+    keepOpen: r.keepOpen === true || manualHandoff,
+    handoff: r.handoff === true || manualHandoff,
   };
 }
 
@@ -719,12 +723,15 @@ function tagPasswordCheck(r) {
   };
   const daysAgo = reasonCode === "password_changed" ? normalizedPasswordChangedDays(r, detail) : null;
   if (daysAgo != null) lastPasswordCheck.daysAgo = daysAgo;
+  const manualHandoff = r.outcome === "need_verify";
   return {
     ...r,
     reasonCode,
     statusPatch: { ...(r.statusPatch || {}) },
     fieldPatch: { ...(r.fieldPatch || {}), lastPasswordCheck },
     stop: true,
+    keepOpen: r.keepOpen === true || manualHandoff,
+    handoff: r.handoff === true || manualHandoff,
   };
 }
 

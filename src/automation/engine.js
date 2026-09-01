@@ -69,6 +69,8 @@ function publicJob(job) {
     id: job.id,
     mode: job.mode,
     phoneMode: job.phoneMode,
+    keepOpenSelected: !!job.requestedKeepOpen,
+    manualChallengePolicy: job.manualChallengePolicy,
     createdAt: job.createdAt,
     actionIds: job.actionIds,
     status: job.status,
@@ -186,11 +188,26 @@ function shouldKeepTaskOpen(jobKeepOpen, actionRequested) {
   return !!(jobKeepOpen || actionRequested);
 }
 
+function normalizeManualChallengePolicy(value) {
+  if (value == null || value === "") return "close";
+  const policy = String(value);
+  if (policy !== "close" && policy !== "keep") {
+    throw new Error("需人工验证窗口策略无效：只能是 close 或 keep");
+  }
+  return policy;
+}
+
+function shouldRetainTaskWindow(jobKeepOpen, actionRequested, manualChallengePolicy) {
+  // 动作明确请求 handoff，说明当前是人机/短信/设备通知等需人工验证页；
+  // 此时独立策略优先于普通“跑完保留窗口”。其它普通结果仍由 jobKeepOpen 控制。
+  if (actionRequested) return manualChallengePolicy === "keep";
+  return !!jobKeepOpen;
+}
+
 function normalizeJobKeepOpen(actionIds, requestedKeepOpen) {
   // 添加手机号批次若沿用全局“跑完保留窗口”，已完成的账号会持续占住并发 slot；
   // 当所有 slot 都被保留后，schedule 只能把剩余账号判为无可用环境。
-  // 动作自身的 keepOpen（短信码 / 人机验证 / 人工接管）不受这里影响，
-  // runTask 仍会通过 shouldKeepTaskOpen(false, true) 保留现场。
+  // 动作自身的人机/短信/人工接管请求由 manualChallengePolicy 单独决定。
   return !actionIds.includes("add-2fa-phone") && !!requestedKeepOpen;
 }
 
@@ -371,11 +388,13 @@ async function runTask(job, env, task) {
         browser: session.browser,
         session,
         phoneMode: job.phoneMode,
+        manualChallengePolicy: job.manualChallengePolicy,
       });
-      // 动作可为当前账号请求人工接管（例如短信验证码页）。这只保留当前任务的窗口，
-      // 不会把整个批次的其它窗口都改成“保留”。handoff=true 时还需保持当前页焦点。
-      if (res.keepOpen === true) keepOpenRequested = true;
-      if (res.handoff === true) handoffRequested = true;
+      // need_verify 本身就代表当前账号需要人工判断；不要求每个动作都重复声明 keepOpen，
+      // 统一交给独立策略决定关窗还是保留。保留时停在当前页面，不新开结果标签遮住现场。
+      const needsManualAttention = res.outcome === "need_verify" || res.keepOpen === true;
+      if (needsManualAttention) keepOpenRequested = true;
+      if (res.handoff === true || res.outcome === "need_verify") handoffRequested = true;
       // 写回账号库
       const patch = {};
       if (res.statusPatch && Object.keys(res.statusPatch).length) patch.status = res.statusPatch;
@@ -421,7 +440,7 @@ async function runTask(job, env, task) {
     emit("error", { message: err.message });
   } finally {
     const keepThisTaskOpen = !job.cancelled && windowOpened
-      && shouldKeepTaskOpen(job.keepOpen, keepOpenRequested);
+      && shouldRetainTaskWindow(job.keepOpen, keepOpenRequested, job.manualChallengePolicy);
     if (keepThisTaskOpen) {
       // 保留窗口：只断开自动化连接，不清空、不关窗，方便人工接着看/操作。
       // 本机模式同样保留：不杀进程（临时目录也随之保留，直到用户手动关闭浏览器）。
@@ -506,7 +525,7 @@ function summarizeForLabel(task) {
   return lines;
 }
 
-function createJob({ apiKey, envSerials, accountIds, actionIds, maxConcurrent, targets, randomFp, clearData, keepOpen, proxy, mode, phoneMode }) {
+function createJob({ apiKey, envSerials, accountIds, actionIds, maxConcurrent, targets, randomFp, clearData, keepOpen, manualChallengePolicy, proxy, mode, phoneMode }) {
   const selectedActionIds = actions.normalizeSelection(actionIds);
   const actionError = actions.validateSelection(selectedActionIds);
   if (actionError) throw new Error(actionError);
@@ -547,7 +566,9 @@ function createJob({ apiKey, envSerials, accountIds, actionIds, maxConcurrent, t
     // 本机模式没有 AdsPower 指纹概念，randomFp 不适用，固定为 false。
     randomFp: runMode === "local" ? false : randomFp !== false,
     clearData: clearData !== false,
+    requestedKeepOpen: !!keepOpen,
     keepOpen: normalizeJobKeepOpen(selectedActionIds, keepOpen),
+    manualChallengePolicy: normalizeManualChallengePolicy(manualChallengePolicy),
     // proxy：AdsPower 代理池字段（enabled/tagId/proxyIds）保持原样；
     // 本机模式预留 proxy.server（规划中，透传给 --proxy-server，UI 暂未对接）。
     proxy: runMode === "local"
@@ -591,6 +612,8 @@ module.exports = {
     isFatalLocalStartupError,
     buildUnhandledLoginResult,
     shouldKeepTaskOpen,
+    shouldRetainTaskWindow,
+    normalizeManualChallengePolicy,
     normalizeJobKeepOpen,
     isEnvReusable,
     finishQueuedWithoutReusableEnv,

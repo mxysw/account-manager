@@ -725,16 +725,17 @@ async function addPhone(page, account, ctx = {}) {
     const phoneAdd = detail.phoneAdd
       ? `${sharedDetail || "本账号的手机号添加任务已结束"}；本账号的共享号码占用已释放`
       : "本账号的手机号添加任务已结束；本账号的共享号码占用已释放";
-    // 共享号码普通成功/失败仍关闭窗口并继续队列；但内部登录/重新验证若撞到
-    // 人机或风控页，必须保留当前页给人工接管，不能被共享收尾再次抹掉。
+    // 共享号码普通成功/失败仍关闭窗口并继续队列；内部登录/重新验证若撞到
+    // 人机或风控页，则报告人工接管候选，由引擎的独立策略决定关窗还是保留。
     const keepBlockedWindow = result.reasonCode === "phone_add_blocked"
       && result.keepOpen === true;
+    const retainBlockedWindow = keepBlockedWindow && ctx.manualChallengePolicy === "keep";
     return {
       ...result,
       statusPatch: { ...(result.statusPatch || {}), phone: result.outcome === "ok" ? "ok" : "failed" },
       detail: {
         ...detail,
-        phoneAdd: keepBlockedWindow ? `${phoneAdd}；浏览器已保留供人工处理` : phoneAdd,
+        phoneAdd: retainBlockedWindow ? `${phoneAdd}；浏览器已保留供人工处理` : phoneAdd,
       },
       keepOpen: keepBlockedWindow,
       handoff: keepBlockedWindow && result.handoff === true,

@@ -200,7 +200,14 @@
               <label class="switch"><input id="clearData" type="checkbox" checked /> 运行前后清空数据</label>
               <label class="switch" id="optProxy"><input id="useProxy" type="checkbox" /> 动态住宅代理</label>
               <label class="switch" id="optLocalProxy" hidden><input type="checkbox" disabled /> 代理（规划中）</label>
-              <label class="switch"><input id="keepOpen" type="checkbox" /> 跑完保留窗口</label>
+              <label class="switch"><input id="keepOpen" type="checkbox" /> 普通跑完保留</label>
+              <label class="manual-challenge-policy" for="manualChallengePolicy" title="遇到人机、设备通知、短信或其它需人工处理页面时，是关窗继续批量，还是保留当前页">
+                <span>人机/需人工验证</span>
+                <select id="manualChallengePolicy" aria-label="人机或需人工验证时的窗口处理">
+                  <option value="close" selected>检测后关闭</option>
+                  <option value="keep">保留窗口</option>
+                </select>
+              </label>
             </div>
           </div>
           <div id="proxyBox" class="proxy-box" hidden>

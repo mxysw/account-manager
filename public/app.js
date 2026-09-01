@@ -1794,13 +1794,22 @@ function loadFlags() {
   if (typeof f.randomFp === "boolean") el("randomFp").checked = f.randomFp;
   if (typeof f.clearData === "boolean") el("clearData").checked = f.clearData;
   if (typeof f.keepOpen === "boolean") el("keepOpen").checked = f.keepOpen;
+  if (f.manualChallengePolicy === "close" || f.manualChallengePolicy === "keep") {
+    el("manualChallengePolicy").value = f.manualChallengePolicy;
+  }
 }
 function saveFlags() {
-  localStorage.setItem(LS.flags, JSON.stringify({ randomFp: el("randomFp").checked, clearData: el("clearData").checked, keepOpen: el("keepOpen").checked }));
+  localStorage.setItem(LS.flags, JSON.stringify({
+    randomFp: el("randomFp").checked,
+    clearData: el("clearData").checked,
+    keepOpen: el("keepOpen").checked,
+    manualChallengePolicy: el("manualChallengePolicy").value,
+  }));
 }
 el("randomFp").addEventListener("change", saveFlags);
 el("clearData").addEventListener("change", saveFlags);
 el("keepOpen").addEventListener("change", saveFlags);
+el("manualChallengePolicy").addEventListener("change", saveFlags);
 loadFlags();
 
 // ---- 运行模式：调用 AdsPower / 不调用 AdsPower（本机临时浏览器）----
@@ -2030,6 +2039,7 @@ async function startJob(ids) {
         randomFp: el("randomFp").checked,
         clearData: el("clearData").checked,
         keepOpen: el("keepOpen").checked,
+        manualChallengePolicy: el("manualChallengePolicy").value,
         phoneMode: readPhoneRunMode(),
         // 本机模式代理仍在规划中：不传 AdsPower 代理池配置（后端会忽略）。
         proxy: local ? null : readProxyForm(),

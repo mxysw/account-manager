@@ -208,6 +208,8 @@ check("登录结果同时产生粗状态和可持久化精确原因", () => {
   assert.strictEqual(badTotp.statusPatch.login, "2fa_error");
   const captcha = tagLogin({ outcome: "need_verify", reasonCode: "captcha", detail: { login: "人机验证" } });
   assert.strictEqual(captcha.statusPatch.login, "need_verify");
+  assert.strictEqual(captcha.keepOpen, true, "人机页应向引擎报告可人工接管");
+  assert.strictEqual(captcha.handoff, true, "保留时应停在当前人机页而不是打开结果标签");
   assert.strictEqual(Object.prototype.hasOwnProperty.call(captcha.fieldPatch, "lastPasswordCheck"), false, "未证明提交过密码的人机页不能清旧密码检测");
 
   const existingSession = tagLogin({ outcome: "ok", reasonCode: "ok", passwordSubmitted: false, detail: { login: "已有会话" } });
@@ -1770,8 +1772,14 @@ check("手机号 UI/文档以直接添加和稍后生效为默认，验证码仅
   assert.ok(!readmeSource.includes("再填写号码并请求短信验证码"), "不能把请求短信验证码写成默认流程");
   assert.match(htmlSource, /id="phoneImportMode"[\s\S]*value="shared"[\s\S]*value="exclusive"/);
   assert.match(htmlSource, /id="phoneRunMode"[\s\S]*value="shared"[\s\S]*value="exclusive"/);
+  assert.match(htmlSource, /id="manualChallengePolicy"[\s\S]*value="close"[\s\S]*value="keep"/,
+    "批量操作必须提供需人工验证时自动关闭/保留窗口的独立选项");
   assert.match(appSource, /JSON\.stringify\(\{ text, usageMode \}\)/, "导入请求必须携带手机号分配模式");
   assert.match(appSource, /phoneMode:\s*readPhoneRunMode\(\)/, "自动化任务必须携带本次领取模式");
+  assert.match(appSource, /manualChallengePolicy:\s*el\("manualChallengePolicy"\)\.value/,
+    "自动化任务必须携带需人工验证窗口策略");
+  assert.match(appSource, /f\.manualChallengePolicy === "close"[\s\S]*f\.manualChallengePolicy === "keep"/,
+    "刷新后只能恢复合法的需人工验证窗口策略");
   assert.match(appSource, /共享可用（已绑 \$\{count\}）/);
   assert.match(appSource, /data-phone-mode/);
   assert.match(appSource, /function phoneIsBusy[\s\S]*reserved[\s\S]*pending/);
@@ -1808,6 +1816,9 @@ check("添加两步验证手机号已注册为高风险写操作、动作独占�
   assert.strictEqual(job.envs.length, 9, "本机模式应创建对应数量的浏览器 slot");
   assert.strictEqual(job.phoneMode, "shared", "未指定时应默认使用可重复绑定的共享号码池");
   assert.strictEqual(engine.publicJob(job).phoneMode, "shared", "公开任务状态应保留手机号分配模式");
+  assert.strictEqual(engine.publicJob(job).keepOpenSelected, false, "公开任务状态应保留用户的窗口开关");
+  assert.strictEqual(job.manualChallengePolicy, "close", "需人工验证窗口默认应检测后关闭");
+  assert.strictEqual(engine.publicJob(job).manualChallengePolicy, "close");
   const exclusiveJob = engine.createJob({
     mode: "local", envSerials: [], accountIds: [], actionIds: ["add-2fa-phone"], maxConcurrent: 6, phoneMode: "exclusive",
   });
@@ -1818,6 +1829,10 @@ check("添加两步验证手机号已注册为高风险写操作、动作独占�
     () => engine.createJob({ mode: "local", envSerials: [], accountIds: [], actionIds: ["add-2fa-phone"], phoneMode: "invalid" }),
     /手机号使用模式无效/,
   );
+  assert.throws(
+    () => engine.createJob({ mode: "local", envSerials: [], accountIds: [], actionIds: ["login"], manualChallengePolicy: "invalid" }),
+    /需人工验证窗口策略无效/,
+  );
   assert.strictEqual(engine.helpers.shouldKeepTaskOpen(false, true), true);
   assert.strictEqual(engine.helpers.shouldKeepTaskOpen(false, false), false);
   assert.strictEqual(
@@ -1825,6 +1840,16 @@ check("添加两步验证手机号已注册为高风险写操作、动作独占�
     true,
     "普通登录触发人机时即使动作本身未请求接管，勾选保留窗口也必须生效",
   );
+  assert.strictEqual(engine.helpers.shouldRetainTaskWindow(false, true, "close"), false,
+    "人机策略选择检测后关闭时，动作请求人工接管也必须自动关窗");
+  assert.strictEqual(engine.helpers.shouldRetainTaskWindow(false, true, "keep"), true,
+    "人机策略选择保留时，应保留当前挑战页");
+  assert.strictEqual(engine.helpers.shouldRetainTaskWindow(true, true, "close"), false,
+    "具体的人机关闭策略应优先于普通跑完保留选项");
+  assert.strictEqual(engine.helpers.shouldRetainTaskWindow(true, false, "close"), true,
+    "没有需人工验证时，普通跑完保留选项仍应生效");
+  assert.strictEqual(engine.helpers.shouldRetainTaskWindow(false, false, "keep"), false,
+    "人机保留不能把正常完成窗口也留下");
 });
 
 check("添加手机号忽略全局保留窗口，普通成功后对应环境仍可继续下一个账号", () => {
@@ -1838,6 +1863,8 @@ check("添加手机号忽略全局保留窗口，普通成功后对应环境仍�
   });
   assert.strictEqual(job.maxConcurrent, 8);
   assert.strictEqual(job.envs.length, 8);
+  assert.strictEqual(job.requestedKeepOpen, true, "应单独记住用户的普通窗口选项");
+  assert.strictEqual(engine.publicJob(job).keepOpenSelected, true);
   assert.strictEqual(job.keepOpen, false, "添加手机号批次不能因全局保留选项占满并发 slot");
   assert.strictEqual(
     engine.helpers.normalizeJobKeepOpen(["login"], true),
@@ -1867,10 +1894,11 @@ check("添加手机号动作主动请求人工接管时只占当前 slot，全�
     accountIds: [],
     actionIds: ["add-2fa-phone"],
     keepOpen: true,
+    manualChallengePolicy: "keep",
   });
   const retainedEnv = {
     busy: false,
-    retained: engine.helpers.shouldKeepTaskOpen(job.keepOpen, true),
+    retained: engine.helpers.shouldRetainTaskWindow(job.keepOpen, true, job.manualChallengePolicy),
   };
   const reusableEnv = { busy: false, retained: false };
   const queued = { status: "queued", error: null, events: [] };
@@ -3198,6 +3226,7 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
     const blockerPool = makePool();
     const blocked = await addPhone({}, { id: "acc-blocked", email: "blocked@example.com" }, {
       phonePool: blockerPool,
+      manualChallengePolicy: "keep",
       drivePhoneFlow: async () => ({ kind: "blocked", submitted: false, detail: "Google 要求人机验证" }),
     });
     assert.strictEqual(blocked.outcome, "need_verify");
@@ -3207,11 +3236,47 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
     assert.strictEqual(blocked.handoff, true, "保留人机页时不能另开结果标签覆盖当前页面");
     assert.match(blocked.detail.phoneAdd, /浏览器已保留供人工处理/);
     assert.strictEqual(
-      engine.helpers.shouldKeepTaskOpen(false, blocked.keepOpen),
+      engine.helpers.shouldRetainTaskWindow(false, blocked.keepOpen, "keep"),
       true,
       "添加手机号即使忽略普通完成的全局保留，人机接管请求仍必须进入引擎保留分支",
     );
     assert.strictEqual(blockerPool.calls.released, 1, "验证码尚未提交时号码应安全释放");
+
+    const autoClosePool = makePool();
+    const autoClosed = await addPhone({}, { id: "acc-auto-close", email: "auto-close@example.com" }, {
+      phonePool: autoClosePool,
+      manualChallengePolicy: "close",
+      drivePhoneFlow: async () => ({ kind: "blocked", submitted: false, detail: "Google 要求人机验证" }),
+    });
+    assert.strictEqual(autoClosed.outcome, "need_verify", "自动关窗不能丢失人机验证结果");
+    assert.strictEqual(autoClosed.reasonCode, "phone_add_blocked");
+    assert.strictEqual(autoClosed.keepOpen, true, "动作应继续报告当前页适合人工接管");
+    assert.strictEqual(autoClosed.handoff, true);
+    assert.strictEqual(
+      engine.helpers.shouldRetainTaskWindow(false, autoClosed.keepOpen, "close"),
+      false,
+      "选择检测后关闭时，引擎必须压住动作的保留请求",
+    );
+    assert.doesNotMatch(autoClosed.detail.phoneAdd, /浏览器已保留供人工处理/);
+    assert.strictEqual(autoClosePool.calls.released, 1, "自动关窗后共享号码仍应释放给后续账号");
+
+    const submittedBlockPool = makePool();
+    const submittedBlocked = await addPhone({}, { id: "acc-submitted-block", email: "submitted-block@example.com" }, {
+      phonePool: submittedBlockPool,
+      manualChallengePolicy: "keep",
+      drivePhoneFlow: async () => ({ kind: "blocked", submitted: true, detail: "Save 后出现人机验证" }),
+    });
+    assert.strictEqual(submittedBlocked.outcome, "need_verify");
+    assert.strictEqual(submittedBlocked.reasonCode, "phone_confirmation_pending");
+    assert.strictEqual(
+      engine.helpers.shouldRetainTaskWindow(
+        false,
+        submittedBlocked.outcome === "need_verify" || submittedBlocked.keepOpen === true,
+        "keep",
+      ),
+      true,
+      "Save 后才出现人机时即使共享收尾压掉动作 keepOpen，引擎也必须按 need_verify 保留现场",
+    );
   });
 
   await checkAsync("仅验证密码不要求账号存在 2FA 密钥", async () => {
@@ -3556,6 +3621,119 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
     const result = await login.helpers.fillTotp(fakePage, "JBSWY3DPEHPK3PXP");
     assert.strictEqual(result, false);
     assert.strictEqual(typed, false, "安全代码输入框不得收到任何 TOTP 输入或点击");
+  });
+
+  await checkAsync("需人工验证策略：自动关闭会继续批量且不丢结果，保留模式停在当前页", async () => {
+    const automationBrowser = require("../src/automation/browser");
+    const originalStart = localBrowser.start;
+    const originalConnect = automationBrowser.connect;
+    const originalLoginRun = actionsRegistry.REGISTRY.login.run;
+    const createdAccounts = [];
+    let activeJob = null;
+
+    const waitForDone = async (job, timeoutMs = 3000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (job.status === "running" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.notStrictEqual(job.status, "running", "模拟批量任务应在超时前结束");
+    };
+
+    const seedAccounts = (count, label) => {
+      const stamp = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+      const emails = Array.from({ length: count }, (_, index) => `__captcha_${label}_${stamp}_${index}@example.com`);
+      accounts.importText(emails.map((email) => `${email}|pw123|JBSWY3DPEHPK3PXP`).join("\n"), {});
+      const seeded = emails.map((email) => accounts.list().find((item) => item.email === email));
+      assert.ok(seeded.every(Boolean));
+      createdAccounts.push(...seeded);
+      return seeded;
+    };
+
+    const counters = { starts: 0, stops: 0, closes: 0, disconnects: 0, labels: 0 };
+    try {
+      localBrowser.start = async () => {
+        counters.starts += 1;
+        return {
+          cdpEndpoint: `http://127.0.0.1:${12000 + counters.starts}`,
+          port: 12000 + counters.starts,
+          executablePath: "chrome.exe",
+          stop: async () => { counters.stops += 1; },
+        };
+      };
+      automationBrowser.connect = async () => ({
+        page: {},
+        close: async () => { counters.closes += 1; },
+        disconnect: async () => { counters.disconnects += 1; },
+        label: async () => { counters.labels += 1; return { ok: true }; },
+      });
+      actionsRegistry.REGISTRY.login.run = async () => ({
+        ...login.helpers.tagLogin({
+          outcome: "need_verify",
+          reasonCode: "captcha",
+          detail: { login: "出现验证码 / 人机验证，需人工处理" },
+        }),
+        // 故意模拟一个忘记声明 keepOpen/handoff 的动作，证明引擎会统一按 need_verify 套用策略。
+        keepOpen: false,
+        handoff: false,
+      });
+
+      const closingAccounts = seedAccounts(2, "close");
+      activeJob = engine.createJob({
+        mode: "local",
+        envSerials: [],
+        accountIds: closingAccounts.map((item) => item.id),
+        actionIds: ["login"],
+        maxConcurrent: 1,
+        clearData: false,
+        keepOpen: true,
+        manualChallengePolicy: "close",
+      });
+      await waitForDone(activeJob);
+      assert.strictEqual(counters.starts, 2, "同一 slot 应在关掉第一个人机窗口后继续第二个账号");
+      assert.strictEqual(counters.closes, 2);
+      assert.strictEqual(counters.stops, 2);
+      assert.strictEqual(counters.disconnects, 0);
+      assert.strictEqual(counters.labels, 0);
+      assert.strictEqual(activeJob.envs[0].retained, false);
+      assert.deepStrictEqual(activeJob.tasks.map((task) => task.env), ["本地#1", "本地#1"]);
+      for (const task of activeJob.tasks) {
+        assert.strictEqual(task.status, "done");
+        assert.ok(task.events.some((event) => event.type === "env_closed"));
+        assert.strictEqual(task.results[0].outcome, "need_verify");
+        assert.strictEqual(task.results[0].reasonCode, "captcha");
+        const saved = accounts.getById(task.accountId);
+        assert.strictEqual(saved.status.login, "need_verify");
+        assert.strictEqual(saved.lastLoginCheck.reasonCode, "captcha");
+      }
+
+      const keepAccount = seedAccounts(1, "keep")[0];
+      activeJob = engine.createJob({
+        mode: "local",
+        envSerials: [],
+        accountIds: [keepAccount.id],
+        actionIds: ["login"],
+        maxConcurrent: 1,
+        clearData: false,
+        keepOpen: false,
+        manualChallengePolicy: "keep",
+      });
+      await waitForDone(activeJob);
+      assert.strictEqual(counters.starts, 3);
+      assert.strictEqual(counters.closes, 2, "保留策略不能关闭当前挑战页");
+      assert.strictEqual(counters.stops, 2, "保留策略不能杀掉本机临时浏览器");
+      assert.strictEqual(counters.disconnects, 1, "保留现场时只断开自动化连接");
+      assert.strictEqual(counters.labels, 0, "人工接管应停在挑战页，不能新开结果标签遮住现场");
+      assert.strictEqual(activeJob.envs[0].retained, true);
+      assert.strictEqual(accounts.getById(keepAccount.id).lastLoginCheck.reasonCode, "captcha");
+    } finally {
+      if (activeJob && activeJob.envs.some((env) => env.retained || env.busy)) {
+        await engine.cancelJob(activeJob.id).catch(() => {});
+      }
+      localBrowser.start = originalStart;
+      automationBrowser.connect = originalConnect;
+      actionsRegistry.REGISTRY.login.run = originalLoginRun;
+      if (createdAccounts.length) accounts.remove(createdAccounts.map((item) => item.id));
+    }
   });
 
   await checkAsync("本机浏览器冷启动会等到 WebSocket 地址出现后再放行", async () => {

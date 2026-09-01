@@ -493,6 +493,7 @@ const ROUTES = [
         apiKey, mode, envSerials, accountIds, actionIds,
         maxConcurrent: body.maxConcurrent, targets: body.targets,
         randomFp: body.randomFp, clearData: body.clearData, keepOpen: body.keepOpen,
+        manualChallengePolicy: body.manualChallengePolicy,
         phoneMode: body.phoneMode,
         proxy,
       });
