@@ -1188,6 +1188,17 @@ check("手机号 binding 持久化来源/验证/生效状态，安全联表只�
     assert.strictEqual(phonePool.numberForAccount(claim.item.id, account), "", "已移除绑定不能再复制完整号");
     assert.strictEqual(phonePool.markAccountBindingsRemoved(account).changed, 0, "重复移除应幂等");
 
+    const reboundClaim = phonePool.claimForAccount(account, { mode: "shared" });
+    assert.notStrictEqual(reboundClaim.leaseId, claim.leaseId, "解绑后再次绑定必须创建新 lease");
+    assert.ok(phonePool.confirmUsed(reboundClaim.item.id, reboundClaim.leaseId, {
+      origin: "added",
+      verification: "not_requested",
+      activation: "ready",
+    }));
+    binding = phonePool.getById(claim.item.id).bindings[0];
+    assert.strictEqual(binding.active, true);
+    assert.strictEqual(binding.completedLeaseId, reboundClaim.leaseId, "重新绑定必须更新完成 token");
+
     const preexistingAccount = { id: "binding-preexisting-account", email: "binding-preexisting@example.com" };
     const preexistingClaim = phonePool.claimForAccount(preexistingAccount, { mode: "shared" });
     phonePool.confirmUsed(preexistingClaim.item.id, preexistingClaim.leaseId, {
@@ -1199,6 +1210,12 @@ check("手机号 binding 持久化来源/验证/生效状态，安全联表只�
     assert.strictEqual(preexisting.origin, "preexisting");
     assert.strictEqual(preexisting.verification, "sms_completed");
     assert.strictEqual(preexisting.activation, "ready");
+    assert.ok(
+      phonePool.confirmUsed(reboundClaim.item.id, reboundClaim.leaseId, {
+        origin: "added", verification: "not_requested", activation: "ready",
+      }),
+      "其它账号推进根投影后，最新一轮重新绑定的迟到确认仍必须幂等",
+    );
 
     phonePool.importText("+12025550992", { usageMode: "exclusive" });
     const manualPhone = phonePool.list().find((item) => item.number === "+12025550992");
@@ -1214,29 +1231,30 @@ check("手机号 binding 持久化来源/验证/生效状态，安全联表只�
   }
 });
 
-check("手机号池领取使用独占 lease；reserved 拒绝第二 runner，pending 仅只读复查", () => {
+check("一号一绑领取使用独占 lease；reserved 拒绝第二 runner，pending 仅只读复查", () => {
   const a = { id: "account-a", email: "a@example.com" };
   const b = { id: "account-b", email: "b@example.com" };
   const c = { id: "account-c", email: "c@example.com" };
-  const claimA = phonePool.claimForAccount(a);
+  phonePool.importText(["+12025550981", "+12025550982"].join("\n"), { usageMode: "exclusive" });
+  const claimA = phonePool.claimForAccount(a, { mode: "exclusive" });
   assert.strictEqual(claimA.readOnly, false);
   assert.throws(
-    () => phonePool.claimForAccount(a),
+    () => phonePool.claimForAccount(a, { mode: "exclusive" }),
     (err) => err && err.code === "PHONE_STATE_CONFLICT" && /任务正在提交/.test(err.message),
     "reserved 必须拒绝同账号第二个 runner，不能共享提交权",
   );
-  const claimB = phonePool.claimForAccount(b);
+  const claimB = phonePool.claimForAccount(b, { mode: "exclusive" });
   assert.ok(claimA && claimB);
   assert.notStrictEqual(claimA.item.id, claimB.item.id, "不同账号必须领取不同号码");
-  assert.strictEqual(phonePool.claimForAccount(c), null, "两个号码均占用后第三账号不能再领取");
+  assert.strictEqual(phonePool.claimForAccount(c, { mode: "exclusive" }), null, "两个独享号码均占用后第三账号不能再领取");
 
   assert.strictEqual(phonePool.release(claimA.item.id, "wrong-lease"), null, "错误 lease 不能释放别人的号码");
   assert.ok(phonePool.release(claimA.item.id, claimA.leaseId), "尚未提交的 reserved 可释放");
-  const claimC = phonePool.claimForAccount(c);
+  const claimC = phonePool.claimForAccount(c, { mode: "exclusive" });
   assert.strictEqual(claimC.item.id, claimA.item.id, "释放后可重新领取");
   assert.strictEqual(phonePool.markPending(claimC.item.id, claimA.leaseId), null, "旧 lease 的迟到写入必须失效");
   assert.ok(phonePool.markPending(claimC.item.id, claimC.leaseId));
-  const reviewC = phonePool.claimForAccount(c);
+  const reviewC = phonePool.claimForAccount(c, { mode: "exclusive" });
   assert.strictEqual(reviewC.item.id, claimC.item.id);
   assert.strictEqual(reviewC.leaseId, claimC.leaseId, "pending 复查保留原 lease，不能使仍在观察成功页的 runner 失效");
   assert.strictEqual(reviewC.readOnly, true, "pending 领取必须显式标记为只读");
@@ -1246,54 +1264,82 @@ check("手机号池领取使用独占 lease；reserved 拒绝第二 runner，pen
   assert.ok(phonePool.markFailed(claimB.item.id, claimB.leaseId, "测试拒绝"));
 });
 
-check("共享号码可依次绑定多个账号，同时始终只有一个 active lease", () => {
-  const shared = phonePool.list().find((item) => item.usageMode === "shared" && item.status === "used");
-  assert.ok(shared, "前置测试应留下一个已成功绑定的共享号码");
+check("同一个共享号码支持多账号并发 attempt，交错成功/失败/释放互不影响", () => {
+  const data = phonePool._db.get();
+  const snapshot = JSON.parse(JSON.stringify(data.phones));
+  try {
+    data.phones = [];
+    phonePool._db.flushSync();
+    const number = "+12025550983";
+    phonePool.importText(number, { usageMode: "shared" });
+    const shared = phonePool.list().find((item) => item.number === number);
+    assert.ok(shared);
   const initialCount = shared.bindings.length;
   const accountD = { id: "shared-account-d", email: "shared-d@example.com" };
   const accountE = { id: "shared-account-e", email: "shared-e@example.com" };
   const accountF = { id: "shared-account-f", email: "shared-f@example.com" };
+  const accountG = { id: "shared-account-g", email: "shared-g@example.com" };
 
   const claimD = phonePool.claimForAccount(accountD, { mode: "shared" });
-  assert.strictEqual(claimD.item.id, shared.id, "共享号码用过后仍应再次进入可领取集合");
-  assert.strictEqual(claimD.reused, true);
-  assert.strictEqual(
-    phonePool.claimForAccount(accountE, { mode: "shared" }),
-    null,
-    "同一个共享号码有 active lease 时不能并发分给另一个账号",
+  const claimE = phonePool.claimForAccount(accountE, { mode: "shared" });
+  const claimF = phonePool.claimForAccount(accountF, { mode: "shared" });
+  assert.strictEqual(claimD.item.id, shared.id);
+  assert.strictEqual(claimE.item.id, shared.id);
+  assert.strictEqual(claimF.item.id, shared.id);
+  assert.strictEqual(new Set([claimD.leaseId, claimE.leaseId, claimF.leaseId]).size, 3);
+  assert.strictEqual(phonePool.toPublic(phonePool.getById(shared.id)).activeCount, 3);
+  assert.strictEqual(phonePool.toPublic(phonePool.getById(shared.id)).available, true, "共享号码并发中仍可继续领取");
+
+  assert.ok(phonePool.markSubmitIntent(shared.id, claimD.leaseId, "D 即将提交"));
+  assert.ok(phonePool.markPending(shared.id, claimE.leaseId, "E 已保存"));
+  assert.ok(phonePool.clearSubmitIntent(shared.id, claimD.leaseId, "D 尚未保存"));
+  assert.ok(phonePool.markFailed(shared.id, claimF.leaseId, "F 被拒绝"));
+  assert.strictEqual(phonePool.getAttempt(shared.id, claimD.leaseId).submitIntentAt, "");
+  assert.strictEqual(phonePool.getAttempt(shared.id, claimE.leaseId).status, "pending");
+  assert.strictEqual(phonePool.getAttempt(shared.id, claimF.leaseId), null, "F 失败只能结束 F 的 attempt");
+
+  assert.ok(phonePool.confirmUsed(shared.id, claimE.leaseId));
+  assert.ok(
+    phonePool.getById(shared.id).bindings.some((binding) => binding.accountId === accountE.id),
+    "E 的 lease 必须绑定到 E，不能使用共享根对象里其它账号的 usedBy",
   );
-  assert.ok(phonePool.confirmUsed(shared.id, claimD.leaseId));
+  assert.strictEqual(phonePool.getAttempt(shared.id, claimD.leaseId).status, "reserved", "E 成功不能清掉 D");
+  assert.strictEqual(phonePool.toPublic(phonePool.getById(shared.id)).activeCount, 1);
+  assert.ok(phonePool.confirmUsed(shared.id, claimE.leaseId), "同一完成 lease 的迟到成功确认应幂等");
+  assert.strictEqual(phonePool.getAttempt(shared.id, claimD.leaseId).status, "reserved");
+  assert.ok(phonePool.releaseSharedAttempt(shared.id, claimD.leaseId, "D 主动结束"));
 
   let dto = phonePool.toPublic(phonePool.getById(shared.id));
   assert.strictEqual(dto.usageMode, "shared");
   assert.strictEqual(dto.bindingCount, initialCount + 1);
-  assert.strictEqual(dto.available, true, "共享号码完成后应立即恢复为共享可用");
+  assert.strictEqual(dto.activeCount, 0);
+  assert.strictEqual(dto.available, true, "全部 attempt 结束后仍应共享可用");
   assert.strictEqual(Object.prototype.hasOwnProperty.call(dto, "bindings"), false, "公开 DTO 不得泄露绑定明细");
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(dto, "attempts"), false, "公开 DTO 不得泄露并发 attempt");
 
-  const claimE = phonePool.claimForAccount(accountE, { mode: "shared" });
-  assert.strictEqual(claimE.item.id, shared.id);
-  const lateD = phonePool.confirmUsed(shared.id, claimD.leaseId);
-  assert.ok(lateD, "上一个账号的迟到成功确认应幂等返回");
-  assert.strictEqual(phonePool.getById(shared.id).leaseId, claimE.leaseId, "迟到确认不能覆盖下一个账号的 active lease");
-  assert.strictEqual(phonePool.getById(shared.id).status, "reserved");
-  assert.ok(phonePool.confirmUsed(shared.id, claimE.leaseId));
+  const claimG = phonePool.claimForAccount(accountG, { mode: "shared" });
+  assert.strictEqual(claimG.item.id, shared.id);
+  assert.ok(phonePool.confirmUsed(shared.id, claimG.leaseId));
   dto = phonePool.toPublic(phonePool.getById(shared.id));
   assert.strictEqual(dto.bindingCount, initialCount + 2, "同一个共享号码应累计多个不同账号绑定");
+  const boundAccounts = new Set(phonePool.getById(shared.id).bindings.map((binding) => binding.accountId));
+  assert.ok(boundAccounts.has(accountE.id) && boundAccounts.has(accountG.id));
+  assert.ok(!boundAccounts.has(accountD.id) && !boundAccounts.has(accountF.id), "失败或释放的 attempt 不能写成成功绑定");
 
-  const repeatD = phonePool.claimForAccount(accountD, { mode: "shared" });
-  assert.strictEqual(repeatD.alreadyUsed, true, "同账号重复运行应识别已有绑定而不是再次提交");
-  assert.strictEqual(repeatD.readOnly, true);
+  const repeatE = phonePool.claimForAccount(accountE, { mode: "shared" });
+  assert.strictEqual(repeatE.alreadyUsed, true, "同账号重复运行应识别已有绑定而不是再次提交");
+  assert.strictEqual(repeatE.readOnly, true);
   assert.strictEqual(phonePool.toPublic(phonePool.getById(shared.id)).bindingCount, initialCount + 2);
 
-  const claimF = phonePool.claimForAccount(accountF, { mode: "shared" });
+  const claimH = phonePool.claimForAccount({ id: "shared-account-h", email: "shared-h@example.com" }, { mode: "shared" });
   assert.throws(
     () => phonePool.update(shared.id, { usageMode: "exclusive" }),
     (err) => err && err.code === "PHONE_STATE_CONFLICT",
     "active lease 期间不能切换共享/独享模式",
   );
-  assert.ok(phonePool.markFailed(shared.id, claimF.leaseId, "本次绑定被 Google 拒绝"));
+  assert.ok(phonePool.releaseSharedAttempt(shared.id, claimH.leaseId, "测试收尾"));
   dto = phonePool.toPublic(phonePool.getById(shared.id));
-  assert.strictEqual(dto.status, "used", "已有绑定历史时，本次失败不能抹掉既有绑定");
+  assert.strictEqual(dto.status, "used", "结束并发 attempt 不能抹掉既有绑定");
   assert.strictEqual(dto.bindingCount, initialCount + 2);
   assert.strictEqual(dto.available, true);
   assert.deepStrictEqual(dto.allowedStatuses, ["used", "disabled"]);
@@ -1322,6 +1368,10 @@ check("共享号码可依次绑定多个账号，同时始终只有一个 active
     (err) => err && err.code === "PHONE_STATE_CONFLICT",
     "已绑定多个账号的共享号码不能伪装成一号一绑",
   );
+  } finally {
+    data.phones = snapshot;
+    phonePool._db.flushSync();
+  }
 });
 
 check("手机号池人工状态转换受约束，used/active 不能删除或重新分配", () => {
@@ -1503,6 +1553,11 @@ check("启动恢复会解除所有共享号码旧占用；一号一绑的可能�
     "exclusive",
   );
   phonePool._db.flushSync();
+  assert.strictEqual(
+    phonePool.getAttempt(submitted.id, submitted.leaseId).submitIntentAt,
+    old,
+    "旧 shared reserved 只要已有 submittedAt，迁移后也必须保留提交意图",
+  );
 
   const recovered = phonePool.recoverUnsubmittedReservations({ allowFresh: true, reason: "测试启动恢复" });
   assert.deepStrictEqual(recovered, { released: 5, toUnused: 4, toUsed: 1 });
@@ -1561,27 +1616,71 @@ check("一号一绑手动释放仅接受超过 10 分钟且时间戳未变化的
   assert.strictEqual(phonePool.remove([released.id]).removed, 1, "测试用独享号码不能影响后续领取顺序");
 });
 
-check("共享号码允许立即手动结束当前账号占用并继续给下一个账号", () => {
-  const number = "+12025550151";
-  phonePool.importText(number, { usageMode: "shared" });
-  const item = phonePool.list().find((entry) => entry.number === number);
-  Object.assign(item, {
-    status: "pending",
-    usedByAccountId: "shared-manual-release-a",
-    usedBy: "shared-manual-release-a@example.com",
-    leaseId: "shared-manual-release-lease",
-    reservedAt: new Date().toISOString(),
-    submitIntentAt: new Date().toISOString(),
-    submittedAt: new Date().toISOString(),
-  });
-  phonePool._db.flushSync();
-  const released = phonePool.releaseUnsubmittedReservation(item.id, {
-    expectedReservedAt: item.reservedAt,
-    reason: "用户立即结束共享占用",
-  });
-  assert.strictEqual(released.status, "unused");
-  assert.strictEqual(phonePool.toPublic(released).available, true);
-  assert.strictEqual(phonePool.remove([released.id]).removed, 1);
+check("共享号码紧急释放按 revision/count 校验整组并发快照，旧页面不能误清新任务", () => {
+  const data = phonePool._db.get();
+  const snapshot = JSON.parse(JSON.stringify(data.phones));
+  try {
+    data.phones = [];
+    phonePool._db.flushSync();
+    const number = "+12025550151";
+    phonePool.importText(number, { usageMode: "shared" });
+    const accountA = { id: "shared-release-a", email: "shared-release-a@example.com" };
+    const accountB = { id: "shared-release-b", email: "shared-release-b@example.com" };
+    const accountC = { id: "shared-release-c", email: "shared-release-c@example.com" };
+    const claimA = phonePool.claimForAccount(accountA, { mode: "shared" });
+    phonePool.markPending(claimA.item.id, claimA.leaseId, "A 已提交");
+    const stale = phonePool.toPublic(phonePool.getById(claimA.item.id));
+    assert.strictEqual(stale.activeCount, 1);
+
+    const claimB = phonePool.claimForAccount(accountB, { mode: "shared" });
+    assert.throws(
+      () => phonePool.releaseUnsubmittedReservation(claimA.item.id, {
+        expectedReservedAt: stale.reservedAt,
+        expectedActiveRevision: stale.activeRevision,
+        expectedActiveCount: stale.activeCount,
+      }),
+      (err) => err && err.code === "PHONE_STATE_CONFLICT" && /并发占用已经变化/.test(err.message),
+      "旧页面显示 1 个占用时不能把后来加入的 B 一并清掉",
+    );
+    assert.ok(phonePool.getAttempt(claimA.item.id, claimA.leaseId));
+    assert.ok(phonePool.getAttempt(claimA.item.id, claimB.leaseId));
+
+    const current = phonePool.toPublic(phonePool.getById(claimA.item.id));
+    const released = phonePool.releaseUnsubmittedReservation(claimA.item.id, {
+      expectedReservedAt: current.reservedAt,
+      expectedActiveRevision: current.activeRevision,
+      expectedActiveCount: current.activeCount,
+      reason: "用户确认紧急释放全部共享占用",
+    });
+    assert.strictEqual(phonePool.toPublic(released).activeCount, 0);
+    assert.strictEqual(phonePool.toPublic(released).available, true);
+
+    const first = phonePool.claimForAccount(accountA, { mode: "shared" });
+    const sameCountStale = phonePool.toPublic(first.item);
+    phonePool.releaseSharedAttempt(first.item.id, first.leaseId, "A 已结束");
+    const replacement = phonePool.claimForAccount(accountC, { mode: "shared" });
+    assert.strictEqual(phonePool.toPublic(replacement.item).activeCount, sameCountStale.activeCount);
+    assert.throws(
+      () => phonePool.releaseUnsubmittedReservation(replacement.item.id, {
+        expectedReservedAt: sameCountStale.reservedAt,
+        expectedActiveRevision: sameCountStale.activeRevision,
+        expectedActiveCount: sameCountStale.activeCount,
+      }),
+      (err) => err && err.code === "PHONE_STATE_CONFLICT",
+      "占用数量相同但账号已经替换时，旧 revision 也必须失效",
+    );
+    assert.ok(phonePool.getAttempt(replacement.item.id, replacement.leaseId));
+    assert.throws(
+      () => phonePool.releaseUnsubmittedReservation(replacement.item.id, {
+        expectedReservedAt: replacement.item.reservedAt,
+      }),
+      (err) => err && err.code === "PHONE_STATE_CONFLICT" && /快照已过期/.test(err.message),
+      "旧页面缺少 revision/count 时必须拒绝且不能降级按 reservedAt 释放",
+    );
+  } finally {
+    data.phones = snapshot;
+    phonePool._db.flushSync();
+  }
 });
 
 check("Next 预提交意图会阻止启动误释放，确认未提交后可安全撤销", () => {
@@ -1624,11 +1723,13 @@ check("手机号池 public DTO 不泄露完整号码、raw、lease 或内部账�
   phonePool.update(internal.id, { notes: `备用联系方式 ${internal.number}` });
   const dto = phonePool.toPublic(internal);
   assert.ok(dto.maskedNumber && dto.last4);
-  for (const key of ["number", "raw", "leaseId", "completedLeaseId", "usedByAccountId", "bindings"]) {
+  for (const key of ["number", "raw", "leaseId", "completedLeaseId", "usedByAccountId", "bindings", "attempts"]) {
     assert.strictEqual(Object.prototype.hasOwnProperty.call(dto, key), false, `public DTO 不应包含 ${key}`);
   }
   assert.ok(["shared", "exclusive"].includes(dto.usageMode));
   assert.ok(Number.isInteger(dto.bindingCount) && dto.bindingCount >= 0);
+  assert.ok(Number.isInteger(dto.activeCount) && dto.activeCount >= 0);
+  assert.ok(Number.isSafeInteger(dto.activeRevision) && dto.activeRevision >= 0);
   assert.strictEqual(typeof dto.available, "boolean");
   assert.ok(!JSON.stringify(dto).includes(internal.number), "public DTO 不应以其它字段回显完整号码");
   if (dto.status === "used" && dto.bindingCount > 0) assert.deepStrictEqual(dto.allowedStatuses, ["used", "disabled"]);
@@ -1661,7 +1762,7 @@ check("手机号 UI/文档以直接添加和稍后生效为默认，验证码仅
   const htmlSource = fs.readFileSync(path.join(__dirname, "..", "public", "index.html"), "utf8");
   const readmeSource = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
   assert.match(htmlSource, /通常会直接添加并提示稍后生效/);
-  assert.match(htmlSource, /若 Google 另行要求验证码，共享批次会记录原因并跳到下一个账号/);
+  assert.match(htmlSource, /共享号码按上方并发数处理/);
   assert.match(appSource, /pending:\s*"待生效 \/ 待确认"/);
   assert.match(readmeSource, /填写号码后点一次 `Next`.*再点一次 `Save`/);
   assert.match(readmeSource, /只有 `Save` 之后 Google 明确显示添加成功、提示 `security delay` \/ 稍后生效/);
@@ -1694,7 +1795,7 @@ check("手机号 UI/文档以直接添加和稍后生效为默认，验证码仅
   assert.match(readmeSource, /新增.*已有.*绑定.*免验.*已验.*待生效/);
 });
 
-check("添加两步验证手机号已注册为高风险写操作且必须独占、单并发", () => {
+check("添加两步验证手机号已注册为高风险写操作、动作独占且遵循任务并发数", () => {
   const item = actionsRegistry.list().find((action) => action.id === "add-2fa-phone");
   assert.ok(item);
   assert.strictEqual(item.risk, "high");
@@ -1703,13 +1804,16 @@ check("添加两步验证手机号已注册为高风险写操作且必须独占�
   assert.strictEqual(typeof actionsRegistry.get("add-2fa-phone").run, "function");
   assert.match(actionsRegistry.validateSelection(["add-2fa-phone", "login"]), /必须单独运行/);
   const job = engine.createJob({ mode: "local", envSerials: [], accountIds: [], actionIds: ["add-2fa-phone"], maxConcurrent: 9 });
-  assert.strictEqual(job.maxConcurrent, 1, "添加手机号可能需要人工接管，必须强制单并发");
+  assert.strictEqual(job.maxConcurrent, 9, "共享号码任务应遵循顶部并发数");
+  assert.strictEqual(job.envs.length, 9, "本机模式应创建对应数量的浏览器 slot");
   assert.strictEqual(job.phoneMode, "shared", "未指定时应默认使用可重复绑定的共享号码池");
   assert.strictEqual(engine.publicJob(job).phoneMode, "shared", "公开任务状态应保留手机号分配模式");
   const exclusiveJob = engine.createJob({
-    mode: "local", envSerials: [], accountIds: [], actionIds: ["add-2fa-phone"], phoneMode: "exclusive",
+    mode: "local", envSerials: [], accountIds: [], actionIds: ["add-2fa-phone"], maxConcurrent: 6, phoneMode: "exclusive",
   });
   assert.strictEqual(exclusiveJob.phoneMode, "exclusive", "应支持显式的一号一绑模式");
+  assert.strictEqual(exclusiveJob.maxConcurrent, 6, "一号一绑任务也应遵循顶部并发数");
+  assert.strictEqual(exclusiveJob.envs.length, 6);
   assert.throws(
     () => engine.createJob({ mode: "local", envSerials: [], accountIds: [], actionIds: ["add-2fa-phone"], phoneMode: "invalid" }),
     /手机号使用模式无效/,
@@ -1718,7 +1822,7 @@ check("添加两步验证手机号已注册为高风险写操作且必须独占�
   assert.strictEqual(engine.helpers.shouldKeepTaskOpen(false, false), false);
 });
 
-check("添加手机号忽略全局保留窗口，普通成功后唯一环境仍可继续下一个账号", () => {
+check("添加手机号忽略全局保留窗口，普通成功后对应环境仍可继续下一个账号", () => {
   const job = engine.createJob({
     mode: "local",
     envSerials: [],
@@ -1727,8 +1831,9 @@ check("添加手机号忽略全局保留窗口，普通成功后唯一环境仍�
     maxConcurrent: 8,
     keepOpen: true,
   });
-  assert.strictEqual(job.maxConcurrent, 1);
-  assert.strictEqual(job.keepOpen, false, "添加手机号批次不能因全局保留选项占住唯一 slot");
+  assert.strictEqual(job.maxConcurrent, 8);
+  assert.strictEqual(job.envs.length, 8);
+  assert.strictEqual(job.keepOpen, false, "添加手机号批次不能因全局保留选项占满并发 slot");
   assert.strictEqual(
     engine.helpers.normalizeJobKeepOpen(["login"], true),
     true,
@@ -1741,7 +1846,7 @@ check("添加手机号忽略全局保留窗口，普通成功后唯一环境仍�
   };
   const queued = { status: "queued", error: null, events: [] };
   assert.strictEqual(env.retained, false, "成功动作没有请求人工接管时不得保留窗口");
-  assert.strictEqual(engine.helpers.isEnvReusable(env), true, "唯一环境应可被下一个账号复用");
+  assert.strictEqual(engine.helpers.isEnvReusable(env), true, "该环境应可被下一个账号复用");
   assert.strictEqual(
     engine.helpers.finishQueuedWithoutReusableEnv({ envs: [env], tasks: [queued] }),
     false,
@@ -1750,7 +1855,7 @@ check("添加手机号忽略全局保留窗口，普通成功后唯一环境仍�
   assert.strictEqual(queued.status, "queued");
 });
 
-check("添加手机号动作主动请求人工接管时仍保留窗口并停止后续账号", () => {
+check("添加手机号动作主动请求人工接管时只占当前 slot，全部 slot 被占后才停止队列", () => {
   const job = engine.createJob({
     mode: "local",
     envSerials: [],
@@ -1758,17 +1863,25 @@ check("添加手机号动作主动请求人工接管时仍保留窗口并停止�
     actionIds: ["add-2fa-phone"],
     keepOpen: true,
   });
-  const env = {
+  const retainedEnv = {
     busy: false,
     retained: engine.helpers.shouldKeepTaskOpen(job.keepOpen, true),
   };
+  const reusableEnv = { busy: false, retained: false };
   const queued = { status: "queued", error: null, events: [] };
-  assert.strictEqual(env.retained, true, "短信码/人机验证等动作级 keepOpen 必须保留现场");
-  assert.strictEqual(engine.helpers.isEnvReusable(env), false);
+  assert.strictEqual(retainedEnv.retained, true, "短信码/人机验证等动作级 keepOpen 必须保留现场");
+  assert.strictEqual(engine.helpers.isEnvReusable(retainedEnv), false);
   assert.strictEqual(
-    engine.helpers.finishQueuedWithoutReusableEnv({ envs: [env], tasks: [queued] }),
+    engine.helpers.finishQueuedWithoutReusableEnv({ envs: [retainedEnv, reusableEnv], tasks: [queued] }),
+    false,
+    "一个 slot 被人工接管时，其它可用 slot 仍应继续队列",
+  );
+  assert.strictEqual(queued.status, "queued");
+  reusableEnv.retained = true;
+  assert.strictEqual(
+    engine.helpers.finishQueuedWithoutReusableEnv({ envs: [retainedEnv, reusableEnv], tasks: [queued] }),
     true,
-    "动作请求人工接管时不能启动下一个账号覆盖现场",
+    "所有 slot 都被人工接管后不能覆盖现场",
   );
   assert.strictEqual(queued.status, "error");
   assert.strictEqual(queued.events[0].type, "env_unavailable");
@@ -2072,6 +2185,7 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
         submittedAt: "",
       });
       phonePool._db.flushSync();
+      let releaseSnapshot = phonePool.toPublic(releasable);
       res = await jsonRequest(`/api/phones/${releasable.id}/release-reservation`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}),
       });
@@ -2083,12 +2197,26 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
       assert.strictEqual(res.status, 400, "手动释放必须拒绝未知字段");
       res = await jsonRequest(`/api/phones/${releasable.id}/release-reservation`, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ expectedReservedAt: "2019-01-01T00:00:00.000Z" }),
+        body: JSON.stringify({ expectedReservedAt: releaseSnapshot.reservedAt }),
       });
-      assert.strictEqual(res.status, 409, "旧页面的占用时间戳不能释放新 lease");
+      assert.strictEqual(res.status, 409, "旧版页面缺少共享 revision/count 时必须拒绝释放");
       res = await jsonRequest(`/api/phones/${releasable.id}/release-reservation`, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ expectedReservedAt: releasable.reservedAt, reason: "API 测试释放" }),
+        body: JSON.stringify({
+          expectedReservedAt: releaseSnapshot.reservedAt,
+          expectedActiveRevision: releaseSnapshot.activeRevision,
+          expectedActiveCount: -1,
+        }),
+      });
+      assert.strictEqual(res.status, 400, "共享 activeCount 非法时必须返回 400");
+      res = await jsonRequest(`/api/phones/${releasable.id}/release-reservation`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedReservedAt: releaseSnapshot.reservedAt,
+          expectedActiveRevision: releaseSnapshot.activeRevision,
+          expectedActiveCount: releaseSnapshot.activeCount,
+          reason: "API 测试释放",
+        }),
       });
       assert.strictEqual(res.status, 200);
       body = await res.json();
@@ -2106,9 +2234,14 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
         submittedAt: "",
       });
       phonePool._db.flushSync();
+      releaseSnapshot = phonePool.toPublic(releasable);
       res = await jsonRequest(`/api/phones/${releasable.id}/release-reservation`, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ expectedReservedAt: releasable.reservedAt }),
+        body: JSON.stringify({
+          expectedReservedAt: releaseSnapshot.reservedAt,
+          expectedActiveRevision: releaseSnapshot.activeRevision,
+          expectedActiveCount: releaseSnapshot.activeCount,
+        }),
       });
       assert.strictEqual(res.status, 200, "共享号码即使本次提交状态不明，也允许结束占用给下一个账号");
       body = await res.json();
@@ -2198,9 +2331,9 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
       body = await res.json();
       assert.ok(!JSON.stringify(body).includes(number), "GET 列表不能泄露完整号码");
       assert.deepStrictEqual(body.usageModes, ["shared", "exclusive"]);
-      assert.ok(body.phones.every((item) => !["number", "raw", "leaseId", "usedByAccountId", "bindings"].some((key) => Object.prototype.hasOwnProperty.call(item, key))));
+      assert.ok(body.phones.every((item) => !["number", "raw", "leaseId", "usedByAccountId", "bindings", "attempts"].some((key) => Object.prototype.hasOwnProperty.call(item, key))));
       assert.ok(body.phones.every((item) => ["shared", "exclusive"].includes(item.usageMode)
-        && Number.isInteger(item.bindingCount) && typeof item.available === "boolean"));
+        && Number.isInteger(item.bindingCount) && Number.isInteger(item.activeCount) && typeof item.available === "boolean"));
     } finally {
       await new Promise((resolve) => apiServer.close(resolve));
     }
@@ -2298,6 +2431,63 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
     assert.match(result.detail.phoneAdd, /一号一绑池/);
     assert.strictEqual(result.stop, true);
     assert.strictEqual(Object.prototype.hasOwnProperty.call(result.statusPatch || {}, "phone"), false);
+  });
+
+  await checkAsync("共享并发添加手机号只读取本 lease 的 attempt，不受同号码其它账号状态干扰", async () => {
+    const item = {
+      id: "phone-concurrent-state",
+      number: "+12025550984",
+      usageMode: "shared",
+      // 根对象故意模拟另一个账号已经 pending；当前账号自己的 attempt 仍是 reserved。
+      status: "pending",
+      leaseId: "other-lease",
+      submitIntentAt: "2026-01-01T00:00:00.000Z",
+      submittedAt: "2026-01-01T00:00:01.000Z",
+    };
+    const mine = {
+      leaseId: "mine-lease",
+      accountId: "concurrent-mine",
+      email: "concurrent-mine@example.com",
+      status: "reserved",
+      reservedAt: "2026-01-01T00:00:02.000Z",
+      submitIntentAt: "",
+      submittedAt: "",
+    };
+    let confirmations = 0;
+    let sawWritable = false;
+    const pool = {
+      claimForAccount: () => ({ item, attempt: { ...mine }, leaseId: mine.leaseId, readOnly: false, alreadyUsed: false }),
+      getAttempt: (_id, leaseId) => leaseId === mine.leaseId ? { ...mine } : null,
+      confirmUsed: () => { confirmations += 1; return item; },
+      releaseSharedAttempt: () => item,
+    };
+    const result = await addPhone({}, { id: mine.accountId, email: mine.email }, {
+      phonePool: pool,
+      drivePhoneFlow: async (_page, _account, _number, flowCtx) => {
+        sawWritable = flowCtx.readOnly === false && flowCtx.alreadySubmitted === false;
+        return { kind: "added", submitted: true, explicitSuccess: true };
+      },
+    });
+    assert.strictEqual(sawWritable, true, "别人的 pending 不能把当前 reserved attempt 误判为只读");
+    assert.strictEqual(confirmations, 1);
+    assert.strictEqual(result.outcome, "ok");
+
+    mine.status = "pending";
+    mine.submitIntentAt = "2026-01-01T00:00:03.000Z";
+    mine.submittedAt = "2026-01-01T00:00:04.000Z";
+    let sawReadOnly = false;
+    const review = await addPhone({}, { id: mine.accountId, email: mine.email }, {
+      phonePool: {
+        ...pool,
+        claimForAccount: () => ({ item: { ...item, status: "reserved" }, attempt: { ...mine }, leaseId: mine.leaseId, readOnly: true, alreadyUsed: false }),
+      },
+      drivePhoneFlow: async (_page, _account, _number, flowCtx) => {
+        sawReadOnly = flowCtx.readOnly === true && flowCtx.alreadySubmitted === true;
+        return { kind: "already_present", submitted: false, explicitSuccess: true };
+      },
+    });
+    assert.strictEqual(sawReadOnly, true, "当前 pending attempt 即使根概览为 reserved 也必须只读复核");
+    assert.strictEqual(review.outcome, "ok");
   });
 
   await checkAsync("Save 点击触发导航异常仍保留 attempted；Next 不锁定，Save 后才 pending", async () => {
@@ -2837,7 +3027,7 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
     assert.match(thrown.detail.phoneAdd, /释放失败/);
   });
 
-  await checkAsync("共享 pending 的复查任务结束后释放号码，不重发且继续下一个账号", async () => {
+  await checkAsync("共享 pending 的只读复查不重发，也不释放原任务 lease", async () => {
     const item = { id: "phone-review", number: "+12025550130", status: "pending", submittedAt: new Date().toISOString() };
     const calls = { pending: 0, failed: 0, released: 0, used: 0 };
     let sawReadOnly = false;
@@ -2859,10 +3049,98 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
     });
     assert.strictEqual(sawReadOnly, true);
     assert.strictEqual(result.outcome, "need_verify");
-    assert.strictEqual(result.statusPatch.phone, "failed");
+    assert.strictEqual(result.statusPatch.phone, "pending");
     assert.strictEqual(result.keepOpen, false);
-    assert.strictEqual(item.status, "unused");
-    assert.deepStrictEqual(calls, { pending: 0, failed: 0, released: 1, used: 0 });
+    assert.strictEqual(item.status, "pending");
+    assert.match(result.detail.phoneAdd, /未修改原任务的共享号码占用/);
+    assert.deepStrictEqual(calls, { pending: 0, failed: 0, released: 0, used: 0 });
+  });
+
+  await checkAsync("共享 pending 观察者结束后，原 runner 仍可用原 lease 确认成功", async () => {
+    const data = phonePool._db.get();
+    const snapshot = JSON.parse(JSON.stringify(data.phones));
+    try {
+      data.phones = [];
+      phonePool._db.flushSync();
+      const number = "+12025550154";
+      const account = { id: "observer-original-account", email: "observer-original@example.com" };
+      phonePool.importText(number, { usageMode: "shared" });
+      const original = phonePool.claimForAccount(account, { mode: "shared" });
+      assert.ok(phonePool.markPending(original.item.id, original.leaseId, "原 runner 已保存，仍在观察结果"));
+
+      const observed = await addPhone({}, account, {
+        phonePool,
+        phoneMode: "shared",
+        drivePhoneFlow: async (_page, _account, _number, flowCtx) => {
+          assert.strictEqual(flowCtx.readOnly, true);
+          return { kind: "rejected", submitted: true, explicitSuccess: false, detail: "观察页尚未确认" };
+        },
+      });
+      assert.strictEqual(observed.statusPatch.phone, "pending");
+      assert.ok(phonePool.getAttempt(original.item.id, original.leaseId), "观察者不能清掉原 runner 的 attempt");
+      assert.ok(phonePool.confirmUsed(original.item.id, original.leaseId, {
+        origin: "added", verification: "not_requested", activation: "ready",
+      }));
+      assert.strictEqual(phonePool.getAttempt(original.item.id, original.leaseId), null);
+      assert.strictEqual(phonePool.publicBindingsForAccount(account).length, 1);
+    } finally {
+      data.phones = snapshot;
+      phonePool._db.flushSync();
+    }
+  });
+
+  await checkAsync("一个共享号码可由真实 addPhone 动作并发绑定多个账号", async () => {
+    const data = phonePool._db.get();
+    const snapshot = JSON.parse(JSON.stringify(data.phones));
+    try {
+      data.phones = [];
+      phonePool._db.flushSync();
+      const number = "+12025550155";
+      const accountsForParallel = Array.from({ length: 6 }, (_, index) => ({
+        id: `parallel-shared-${index + 1}`,
+        email: `parallel-shared-${index + 1}@example.com`,
+      }));
+      phonePool.importText(number, { usageMode: "shared" });
+      let entered = 0;
+      let peakActive = 0;
+      let releaseBarrier;
+      const barrier = new Promise((resolve) => { releaseBarrier = resolve; });
+
+      const jobs = accountsForParallel.map((account) => addPhone({}, account, {
+        phonePool,
+        phoneMode: "shared",
+        drivePhoneFlow: async (_page, _account, _number, flowCtx) => {
+          entered += 1;
+          const current = phonePool.list().find((entry) => entry.number === number);
+          peakActive = Math.max(peakActive, phonePool.toPublic(current).activeCount);
+          if (entered === accountsForParallel.length) releaseBarrier();
+          await barrier;
+          await flowCtx.onSubmitIntent();
+          await flowCtx.onSubmitIntentCleared();
+          await flowCtx.onSubmitIntent();
+          await flowCtx.onSubmitAttempted();
+          return {
+            kind: "added",
+            submitted: true,
+            explicitSuccess: true,
+            activationDeferred: true,
+          };
+        },
+      }));
+      const results = await Promise.all(jobs);
+      assert.strictEqual(entered, accountsForParallel.length);
+      assert.strictEqual(peakActive, accountsForParallel.length, "六个动作必须同时持有同一号码的独立 attempt");
+      assert.ok(results.every((result) => result.outcome === "ok"));
+      const item = phonePool.list().find((entry) => entry.number === number);
+      assert.strictEqual(phonePool.toPublic(item).activeCount, 0);
+      assert.deepStrictEqual(
+        new Set(item.bindings.filter((binding) => binding.active !== false).map((binding) => binding.accountId)),
+        new Set(accountsForParallel.map((account) => account.id)),
+      );
+    } finally {
+      data.phones = snapshot;
+      phonePool._db.flushSync();
+    }
   });
 
   await checkAsync("添加手机号仅凭明确列表/成功证据才标 used；提交前失败会释放", async () => {

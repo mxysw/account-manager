@@ -386,11 +386,14 @@ const ROUTES = [
   ["POST", /^\/api\/phones\/([^/]+)\/release-reservation$/, async (req, m) => {
     const body = await readBody(req);
     if (!body || typeof body !== "object" || Array.isArray(body)) {
-      return { status: 400, body: { error: "请求体必须只包含 expectedReservedAt 和可选 reason" } };
+      return { status: 400, body: { error: "请求体必须包含当前手机号占用快照" } };
     }
     const keys = Object.keys(body);
-    if (keys.some((key) => key !== "expectedReservedAt" && key !== "reason")) {
-      return { status: 400, body: { error: "请求体只支持 expectedReservedAt 和 reason" } };
+    const allowed = new Set([
+      "expectedReservedAt", "expectedActiveRevision", "expectedActiveCount", "reason",
+    ]);
+    if (keys.some((key) => !allowed.has(key))) {
+      return { status: 400, body: { error: "请求体包含不支持的手机号占用快照字段" } };
     }
     const expectedReservedAt = typeof body.expectedReservedAt === "string" ? body.expectedReservedAt.trim() : "";
     if (!expectedReservedAt) {
@@ -399,9 +402,19 @@ const ROUTES = [
     if (Object.prototype.hasOwnProperty.call(body, "reason") && typeof body.reason !== "string") {
       return { status: 400, body: { error: "reason 必须是字符串" } };
     }
+    for (const key of ["expectedActiveRevision", "expectedActiveCount"]) {
+      if (Object.prototype.hasOwnProperty.call(body, key)
+        && (!Number.isSafeInteger(body[key]) || body[key] < 0)) {
+        return { status: 400, body: { error: `${key} 必须是非负安全整数` } };
+      }
+    }
     try {
       const phone = phones.releaseUnsubmittedReservation(m[1], {
         expectedReservedAt,
+        ...(Object.prototype.hasOwnProperty.call(body, "expectedActiveRevision")
+          ? { expectedActiveRevision: body.expectedActiveRevision } : {}),
+        ...(Object.prototype.hasOwnProperty.call(body, "expectedActiveCount")
+          ? { expectedActiveCount: body.expectedActiveCount } : {}),
         reason: String(body.reason || "用户手动结束手机号本次账号占用").slice(0, 500),
       });
       if (!phone) return { status: 404, body: { error: "手机号不存在" } };

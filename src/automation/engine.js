@@ -187,8 +187,8 @@ function shouldKeepTaskOpen(jobKeepOpen, actionRequested) {
 }
 
 function normalizeJobKeepOpen(actionIds, requestedKeepOpen) {
-  // 添加手机号任务必须用同一个 slot 逐号串行：若沿用全局“跑完保留窗口”，
-  // 首个成功账号也会占住唯一环境，schedule 只能把剩余账号判为无环境。
+  // 添加手机号批次若沿用全局“跑完保留窗口”，已完成的账号会持续占住并发 slot；
+  // 当所有 slot 都被保留后，schedule 只能把剩余账号判为无可用环境。
   // 动作自身的 keepOpen（短信码 / 人机验证 / 人工接管）不受这里影响，
   // runTask 仍会通过 shouldKeepTaskOpen(false, true) 保留现场。
   return !actionIds.includes("add-2fa-phone") && !!requestedKeepOpen;
@@ -516,9 +516,7 @@ function createJob({ apiKey, envSerials, accountIds, actionIds, maxConcurrent, t
   }
   const id = genId();
   const runMode = mode === "local" ? "local" : "adspower";
-  // 添加手机号会在短信验证码页交给用户逐个接管；强制单并发，避免同时弹出多个验证码窗口。
-  const concurrencyCeiling = selectedActionIds.includes("add-2fa-phone") ? 1 : 20;
-  const concurrent = Math.min(concurrencyCeiling, Math.max(1, Number(maxConcurrent) || 3));
+  const concurrent = Math.min(20, Math.max(1, Number(maxConcurrent) || 3));
   const tasks = accountIds.map((accountId) => {
     const acc = accounts.getById(accountId);
     return {

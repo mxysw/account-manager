@@ -2244,7 +2244,7 @@ async function pollJob() {
       // 实时刷新账号库：引擎每完成一个动作就已写回库，这里逐轮拉取即可让
       // “每个账号一完成就显示最新检测状态”，无需等整个 job 跑完。
       await refreshAccountsSoft();
-      // 添加手机号会依次经历 reserved → pending → used/failed；同步刷新池，让用户无需手动刷新
+      // 添加手机号每个账号独立经历 reserved → pending → used/failed；同步刷新池便于查看并发数量
       // 就能看到号码已经被哪个账号领取、是否已确认生效或仍需人工处理。
       if ((job.actionIds || []).includes("add-2fa-phone")) await loadPhones({ skipIfEditing: true });
       if (job.status === "done" || job.status === "cancelled") {
@@ -2462,6 +2462,12 @@ function phoneBindingCount(item) {
   return Number.isFinite(count) && count > 0 ? count : 0;
 }
 
+function phoneActiveCount(item) {
+  const count = Math.floor(Number(item && item.activeCount));
+  if (Number.isFinite(count) && count > 0) return count;
+  return item && (item.status === "reserved" || item.status === "pending") ? 1 : 0;
+}
+
 function phoneIsAvailable(item) {
   if (item && typeof item.available === "boolean") return item.available;
   // 兼容页面热更新期间尚未带 available 的旧 DTO；旧接口只有 unused 可领取。
@@ -2471,11 +2477,12 @@ function phoneIsAvailable(item) {
 function phoneStatusPresentation(item) {
   const mode = phoneUsageMode(item);
   const count = phoneBindingCount(item);
+  const active = phoneActiveCount(item);
   if (item && item.status === "reserved" && item.submitIntentAt) {
     return { text: "提交状态待核对", cls: "s-bad" };
   }
   if (mode === "shared" && phoneIsAvailable(item)) {
-    return { text: `共享可用（已绑 ${count}）`, cls: "s-ok" };
+    return { text: active ? `共享可用（并发 ${active}）` : `共享可用（已绑 ${count}）`, cls: "s-ok" };
   }
   if (mode === "exclusive" && item && item.status === "used") {
     return { text: "一号一绑·已用", cls: "s-ok" };
@@ -2491,7 +2498,7 @@ function phoneHasBindings(item) {
 }
 
 function phoneIsBusy(item) {
-  return !!(item && (item.status === "reserved" || item.status === "pending"));
+  return phoneActiveCount(item) > 0;
 }
 
 function phoneStatusOptionText(item, status, statusView) {
@@ -2554,13 +2561,14 @@ function renderPhones() {
       `<option value="${value}"${value === mode ? " selected" : ""}>${escapeHtml(text)}</option>`
     )).join("");
     const bindingCount = phoneBindingCount(item);
+    const activeCount = phoneActiveCount(item);
     const statusDetail = item.lastError ? `<div class="muted" title="${escapeHtml(item.lastError)}">${escapeHtml(item.lastError)}</div>` : "";
     const masked = item.maskedNumber || `•••• ${escapeHtml(item.last4 || "")}`;
     const deleteProtected = phoneDeleteProtected(item);
     const hasBindings = phoneHasBindings(item);
     const sharedActive = mode === "shared" && phoneIsBusy(item);
     const actionButton = sharedActive
-      ? `<button class="ghost slim phone-release" data-phone-id="${item.id}" title="结束本次账号占用，让这个共享号码继续分配给下一个账号">释放共享占用</button>`
+      ? `<button class="ghost slim phone-release" data-phone-id="${item.id}" title="紧急结束这个号码当前全部并发任务的本地占用">释放全部 ${activeCount} 个占用</button>`
       : item.status === "reserved" && !item.submitIntentAt
         ? `<button class="ghost slim phone-release" data-phone-id="${item.id}" title="仅释放未提交的旧占用；正在运行或已经提交的号码不会被释放">释放占用</button>`
       : item.status === "reserved"
@@ -2582,8 +2590,8 @@ function renderPhones() {
   el("phoneEmptyHint").style.display = phones.length ? "none" : "block";
   const sharedAvailable = phones.filter((item) => phoneUsageMode(item) === "shared" && phoneIsAvailable(item)).length;
   const exclusiveUnused = phones.filter((item) => phoneUsageMode(item) === "exclusive" && phoneIsAvailable(item)).length;
-  const pending = phones.filter((item) => item.status === "pending").length;
-  el("phoneBadge").textContent = `${phones.length} 个（共享可用 ${sharedAvailable}，一号一绑未用 ${exclusiveUnused}${pending ? `，待确认 ${pending}` : ""}）`;
+  const active = phones.reduce((total, item) => total + phoneActiveCount(item), 0);
+  el("phoneBadge").textContent = `${phones.length} 个（共享可用 ${sharedAvailable}，一号一绑未用 ${exclusiveUnused}${active ? `，执行中 ${active}` : ""}）`;
   const deletable = rows.filter((item) => !phoneDeleteProtected(item));
   el("phoneSelectAll").disabled = deletable.length === 0;
   el("phoneSelectAll").checked = deletable.length > 0 && deletable.every((item) => phoneSelected.has(item.id));
@@ -2723,21 +2731,26 @@ el("phoneRows").addEventListener("click", async (event) => {
     const item = phones.find((entry) => entry.id === releaseButton.dataset.phoneId);
     if (!item || !phoneIsBusy(item)) return;
     const shared = phoneUsageMode(item) === "shared";
+    const activeCount = phoneActiveCount(item);
     const warning = shared
-      ? "确认立即结束这个账号对共享号码的占用？\n不论当前成功或失败，释放后同一个号码都可继续分配给下一个账号。"
+      ? `确认紧急释放这个共享号码当前全部 ${activeCount} 个本地占用？\n这会让仍在运行的对应任务失去手机号租约；正常批次无需手动释放。`
       : "确认释放这个未提交的旧占用？\n正在执行中的占用和已经点击 Google 保存的号码会被后端拒绝，不会误释放。";
     if (!confirm(warning)) return;
     releaseButton.disabled = true;
     try {
       const data = await api(`/api/phones/${item.id}/release-reservation`, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ expectedReservedAt: item.reservedAt }),
+        body: JSON.stringify({
+          expectedReservedAt: item.reservedAt,
+          expectedActiveRevision: item.activeRevision,
+          expectedActiveCount: activeCount,
+        }),
       });
       const index = phones.findIndex((entry) => entry.id === item.id);
       if (index >= 0 && data.phone) phones[index] = data.phone;
       renderPhones();
       el("phoneImportStatus").textContent = shared
-        ? "共享号码已释放，可以继续绑定下一个账号"
+        ? `共享号码的 ${activeCount} 个占用已全部释放`
         : "旧占用已释放，这个号码可以继续使用";
     } catch (err) {
       el("phoneImportStatus").textContent = `释放失败：${err.message}`;

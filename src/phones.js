@@ -88,6 +88,12 @@ function createFrom(parsed, usageMode = "shared") {
     number: parsed.number,
     usageMode: requireUsageMode(usageMode),
     bindings: [],
+    // 共享号码允许多个账号同时执行。每次领取的可变状态全部放在独立 attempt 中，
+    // 顶层 status/lease 字段仅保留为旧数据兼容和手机号池概览投影。
+    attempts: [],
+    // 只记录 active attempt 集合的变更次数，供手机号池的“释放全部”做乐观并发校验。
+    // 它不包含 lease/account 信息，可以安全下发给本地页面。
+    activeRevision: 0,
     status: "unused",
     usedByAccountId: "",
     usedBy: "",
@@ -103,6 +109,98 @@ function createFrom(parsed, usageMode = "shared") {
     createdAt: now,
     updatedAt: now,
   };
+}
+
+function normalizeAttempt(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const leaseId = String(value.leaseId || "").trim();
+  const status = String(value.status || "reserved").trim().toLowerCase();
+  if (!leaseId || !ACTIVE_STATUSES.has(status)) return null;
+  const reservedAt = String(value.reservedAt || "");
+  const submittedAt = String(value.submittedAt || "");
+  let submitIntentAt = String(value.submitIntentAt || "");
+  if (!submitIntentAt && (status === "pending" || submittedAt)) {
+    submitIntentAt = submittedAt || reservedAt || nowIso();
+  }
+  return {
+    leaseId,
+    accountId: String(value.accountId || value.usedByAccountId || "").trim(),
+    email: String(value.email || value.usedBy || "").trim(),
+    status,
+    reservedAt,
+    submitIntentAt,
+    submittedAt,
+    lastError: String(value.lastError || ""),
+  };
+}
+
+function mergeAttempts(values) {
+  const result = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const attempt = normalizeAttempt(value);
+    if (!attempt || seen.has(attempt.leaseId)) continue;
+    seen.add(attempt.leaseId);
+    result.push(attempt);
+  }
+  return result;
+}
+
+function sharedAttempts(item) {
+  return item && item.usageMode === "shared" && Array.isArray(item.attempts) ? item.attempts : [];
+}
+
+function activeAttemptCount(item) {
+  if (!item) return 0;
+  if (item.usageMode === "shared") return sharedAttempts(item).length;
+  return ACTIVE_STATUSES.has(item.status) && item.leaseId ? 1 : 0;
+}
+
+function bumpActiveRevision(item) {
+  const current = Number.isSafeInteger(item && item.activeRevision) && item.activeRevision >= 0
+    ? item.activeRevision : 0;
+  item.activeRevision = current >= Number.MAX_SAFE_INTEGER ? 1 : current + 1;
+}
+
+function displayAttempt(item) {
+  const attempts = sharedAttempts(item);
+  if (!attempts.length) return null;
+  // 待确认比尚未提交更需要在池中显眼；同状态取最近领取的一次。
+  return attempts.reduce((selected, attempt) => {
+    if (!selected) return attempt;
+    if (attempt.status === "pending" && selected.status !== "pending") return attempt;
+    if (attempt.status !== "pending" && selected.status === "pending") return selected;
+    return String(attempt.reservedAt || "") >= String(selected.reservedAt || "") ? attempt : selected;
+  }, null);
+}
+
+/** 将共享 attempts 投影到旧顶层字段；业务状态机不得再用这些字段识别具体 lease。 */
+function syncSharedProjection(item) {
+  if (!item || item.usageMode !== "shared") return item;
+  const attempts = sharedAttempts(item);
+  if (attempts.length) {
+    const display = displayAttempt(item);
+    item.status = attempts.some((attempt) => attempt.status === "pending") ? "pending" : "reserved";
+    item.usedByAccountId = display ? display.accountId : "";
+    item.usedBy = display ? display.email : "";
+    item.leaseId = display ? display.leaseId : "";
+    item.reservedAt = display ? display.reservedAt : "";
+    item.submitIntentAt = display ? display.submitIntentAt : "";
+    item.submittedAt = display ? display.submittedAt : "";
+    item.lastError = display ? display.lastError : "";
+    item.usedAt = "";
+    return item;
+  }
+
+  clearActiveLease(item);
+  if (ACTIVE_STATUSES.has(item.status)) item.status = bindingCount(item) > 0 ? "used" : "unused";
+  if (bindingCount(item) > 0) restoreRecentOwner(item);
+  else {
+    item.usedByAccountId = "";
+    item.usedBy = "";
+    item.usedAt = "";
+  }
+  return item;
 }
 
 function sameAccount(left, right) {
@@ -246,10 +344,41 @@ function normalizeItem(item) {
   const defaults = {
     usedByAccountId: "", usedBy: "", leaseId: "", completedLeaseId: "",
     reservedAt: "", submitIntentAt: "", submittedAt: "", usedAt: "", lastError: "", notes: "", raw: "",
-    createdAt: "", updatedAt: "",
+    createdAt: "", updatedAt: "", activeRevision: 0,
   };
   for (const [key, value] of Object.entries(defaults)) {
     if (item[key] == null) { item[key] = value; changed = true; }
+  }
+  if (!Number.isSafeInteger(item.activeRevision) || item.activeRevision < 0) {
+    item.activeRevision = 0;
+    changed = true;
+  }
+
+  let attempts = mergeAttempts(item.attempts);
+  // 旧版共享号码只有一组顶层 lease 字段。首次读取时原样迁入 attempts；之后顶层字段
+  // 只是投影，不能再次迁移成重复 attempt。
+  if (item.usageMode === "shared" && ACTIVE_STATUSES.has(item.status) && attempts.length === 0) {
+    const migrated = normalizeAttempt({
+      leaseId: item.leaseId || genId("lease"),
+      accountId: item.usedByAccountId,
+      email: item.usedBy,
+      status: item.status,
+      reservedAt: item.reservedAt || item.updatedAt || item.createdAt || nowIso(),
+      submitIntentAt: item.submitIntentAt,
+      submittedAt: item.submittedAt,
+      lastError: item.lastError,
+    });
+    if (migrated) {
+      attempts.push(migrated);
+      bumpActiveRevision(item);
+    }
+  }
+  if (JSON.stringify(attempts) !== JSON.stringify(item.attempts || [])) {
+    item.attempts = attempts;
+    changed = true;
+  } else if (!Array.isArray(item.attempts)) {
+    item.attempts = attempts;
+    changed = true;
   }
 
   // 兼容旧数据：pending 本身就代表已经跨过不可逆边界；旧 reserved 若已有
@@ -260,6 +389,19 @@ function normalizeItem(item) {
   } else if (item.status === "reserved" && item.submittedAt && !item.submitIntentAt) {
     item.submitIntentAt = String(item.submittedAt);
     changed = true;
+  }
+
+  if (item.usageMode === "shared" && item.attempts.length) {
+    const before = JSON.stringify([
+      item.status, item.usedByAccountId, item.usedBy, item.leaseId, item.reservedAt,
+      item.submitIntentAt, item.submittedAt, item.usedAt, item.lastError,
+    ]);
+    syncSharedProjection(item);
+    const after = JSON.stringify([
+      item.status, item.usedByAccountId, item.usedBy, item.leaseId, item.reservedAt,
+      item.submitIntentAt, item.submittedAt, item.usedAt, item.lastError,
+    ]);
+    if (before !== after) changed = true;
   }
 
   if (!ACTIVE_STATUSES.has(item.status) && bindings.length) {
@@ -314,12 +456,15 @@ function isAvailable(item, requestedMode = "") {
   if (!item) return false;
   normalizeItem(item);
   if (requestedMode && item.usageMode !== requestedMode) return false;
-  if (ACTIVE_STATUSES.has(item.status) || item.status === "failed" || item.status === "disabled") return false;
-  if (item.usageMode === "shared") return item.status === "unused" || item.status === "used";
+  if (item.status === "failed" || item.status === "disabled") return false;
+  // 共享号码的每个账号有独立 attempt，因此已有其它 active attempt 也仍可领取。
+  if (item.usageMode === "shared") return ["unused", "used", "reserved", "pending"].includes(item.status);
+  if (ACTIVE_STATUSES.has(item.status)) return false;
   return item.status === "unused" && bindingCount(item) === 0;
 }
 
 function manualStatusesFor(item) {
+  if (activeAttemptCount(item) > 0) return [item.status];
   // 已经绑定过的号码只能在“已用”和“停用”之间切换。这样既能暂时阻止
   // 共享分配，也不会把 Google 侧已经存在的绑定伪装成未用/失败。
   if (bindingCount(item) > 0) {
@@ -341,8 +486,9 @@ function toPublic(item) {
   if (!item) return null;
   normalizeItem(item);
   const recent = latestBinding(item);
-  const displayUsedBy = ACTIVE_STATUSES.has(item.status)
-    ? String(item.usedBy || "")
+  const attempt = displayAttempt(item);
+  const displayUsedBy = activeAttemptCount(item) > 0
+    ? String(attempt && attempt.email || item.usedBy || "")
     : String(recent && recent.email || item.usedBy || "");
   return {
     id: item.id,
@@ -351,6 +497,8 @@ function toPublic(item) {
     status: item.status,
     usageMode: item.usageMode,
     bindingCount: bindingCount(item),
+    activeCount: activeAttemptCount(item),
+    activeRevision: item.activeRevision,
     available: isAvailable(item),
     allowedStatuses: manualStatusesFor(item),
     // 只显示当前租约或最近一次成功账号的邮箱；内部 accountId/bindings 不出 API。
@@ -495,11 +643,39 @@ function accountKey(account) {
 
 function activeBelongsTo(item, account) {
   const key = accountKey(account);
+  if (item && item.usageMode === "shared") {
+    return sharedAttempts(item).some((attempt) => sameAccount(
+      { accountId: attempt.accountId, email: attempt.email },
+      { accountId: key.id, email: key.email },
+    ));
+  }
   if (!ACTIVE_STATUSES.has(item && item.status)) return false;
   return sameAccount(
     { accountId: item.usedByAccountId, email: item.usedBy },
     { accountId: key.id, email: key.email },
   );
+}
+
+function activeAttemptForAccount(item, account) {
+  const key = accountKey(account);
+  if (!item) return null;
+  if (item.usageMode === "shared") {
+    return sharedAttempts(item).find((attempt) => sameAccount(
+      { accountId: attempt.accountId, email: attempt.email },
+      { accountId: key.id, email: key.email },
+    )) || null;
+  }
+  if (!ACTIVE_STATUSES.has(item.status) || !activeBelongsTo(item, account)) return null;
+  return {
+    leaseId: item.leaseId,
+    accountId: item.usedByAccountId,
+    email: item.usedBy,
+    status: item.status,
+    reservedAt: item.reservedAt,
+    submitIntentAt: item.submitIntentAt,
+    submittedAt: item.submittedAt,
+    lastError: item.lastError,
+  };
 }
 
 function bindingForAccount(item, account) {
@@ -520,9 +696,8 @@ function claimMode(options) {
 }
 
 /**
- * 原子领取：每个号码始终最多一个 active lease。先识别该账号已有 active/binding；
- * shared 在没有 active lease 时可从 used 再次领取给新账号，exclusive 成功一次后不再分配。
- * 首次领取和写入 leaseId 在同一同步调用内完成并立即落盘，避免并发任务拿到同一号码。
+ * 原子领取：shared 为每个账号创建独立 attempt，可把同一个号码同时交给多个任务；
+ * exclusive 仍保持整条号码最多一个 active lease 且成功后不再分配。
  */
 function claimForAccount(account, options = {}) {
   const items = list();
@@ -532,15 +707,26 @@ function claimForAccount(account, options = {}) {
 
   // active 优先于历史 binding，避免异常数据下把仍在提交的任务误报成已完成。
   let item = items.find((entry) => (!mode || entry.usageMode === mode) && activeBelongsTo(entry, account));
-  if (item && item.status === "reserved") {
+  let attempt = item ? activeAttemptForAccount(item, account) : null;
+  if (item && attempt && attempt.status === "reserved") {
     throw stateConflict("该账号已有手机号添加任务正在提交中，请等待当前任务结束后再试");
   }
-  if (item && item.status === "pending") {
-    // pending 只能复用原 token 做只读复查。旧数据缺 token 时补一个，但不改变提交时间。
-    if (!item.leaseId) item.leaseId = genId("lease");
+  if (item && attempt && attempt.status === "pending") {
+    // pending 只能复用原 token 做只读复查。旧独享数据缺 token 时补一个。
+    if (!attempt.leaseId && item.usageMode !== "shared") {
+      item.leaseId = genId("lease");
+      attempt.leaseId = item.leaseId;
+    }
     item.updatedAt = nowIso();
     db.flushSync();
-    return { item, leaseId: item.leaseId, reused: true, alreadyUsed: false, readOnly: true };
+    return {
+      item,
+      attempt: { ...attempt },
+      leaseId: attempt.leaseId,
+      reused: true,
+      alreadyUsed: false,
+      readOnly: true,
+    };
   }
 
   item = items.find((entry) => (!mode || entry.usageMode === mode) && bindingForAccount(entry, account));
@@ -551,33 +737,89 @@ function claimForAccount(account, options = {}) {
       reused: true,
       alreadyUsed: true,
       readOnly: true,
+      attempt: null,
       binding: bindingForAccount(item, account),
     };
   }
 
-  item = items.find((entry) => isAvailable(entry, mode));
+  const candidates = items.filter((entry) => isAvailable(entry, mode));
+  // 多个共享号时优先把任务分给当前并发较少的号码；只有一个共享号时所有并发
+  // 自然落到同一号码，满足一号多绑。独享仍按导入顺序领取不同号码。
+  if (mode === "shared" || (!mode && candidates.some((entry) => entry.usageMode === "shared"))) {
+    const shared = candidates.filter((entry) => entry.usageMode === "shared");
+    if (shared.length) {
+      item = shared.reduce((selected, entry) => (
+        !selected || activeAttemptCount(entry) < activeAttemptCount(selected) ? entry : selected
+      ), null);
+    }
+  }
+  if (!item) item = candidates[0] || null;
   if (!item) return null;
   const reused = bindingCount(item) > 0 || item.status === "used";
   const now = nowIso();
-  item.status = "reserved";
-  item.usedByAccountId = key.id;
-  item.usedBy = String(account && account.email || "").trim();
-  item.leaseId = genId("lease");
-  item.completedLeaseId = "";
-  item.reservedAt = now;
-  item.submitIntentAt = "";
-  item.submittedAt = "";
-  item.usedAt = "";
-  item.lastError = "";
+  const leaseId = genId("lease");
+  attempt = {
+    leaseId,
+    accountId: key.id,
+    email: String(account && account.email || "").trim(),
+    status: "reserved",
+    reservedAt: now,
+    submitIntentAt: "",
+    submittedAt: "",
+    lastError: "",
+  };
+  if (item.usageMode === "shared") {
+    item.attempts.push(attempt);
+    bumpActiveRevision(item);
+    item.completedLeaseId = "";
+    syncSharedProjection(item);
+  } else {
+    item.status = attempt.status;
+    item.usedByAccountId = attempt.accountId;
+    item.usedBy = attempt.email;
+    item.leaseId = attempt.leaseId;
+    item.completedLeaseId = "";
+    item.reservedAt = attempt.reservedAt;
+    item.submitIntentAt = "";
+    item.submittedAt = "";
+    item.usedAt = "";
+    item.lastError = "";
+  }
   item.updatedAt = now;
   db.flushSync();
-  return { item, leaseId: item.leaseId, reused, alreadyUsed: false, readOnly: false };
+  return { item, attempt: { ...attempt }, leaseId, reused, alreadyUsed: false, readOnly: false };
+}
+
+function getAttempt(id, leaseId) {
+  const item = getById(id);
+  if (!item || !leaseId) return null;
+  if (item.usageMode === "shared") {
+    const attempt = sharedAttempts(item).find((entry) => entry.leaseId === leaseId);
+    return attempt ? { ...attempt } : null;
+  }
+  if (item.leaseId !== leaseId || !ACTIVE_STATUSES.has(item.status)) return null;
+  return {
+    leaseId: item.leaseId,
+    accountId: item.usedByAccountId,
+    email: item.usedBy,
+    status: item.status,
+    reservedAt: item.reservedAt,
+    submitIntentAt: item.submitIntentAt,
+    submittedAt: item.submittedAt,
+    lastError: item.lastError,
+  };
 }
 
 function validateLease(id, leaseId, allowed) {
   const item = getById(id);
-  if (!item || !leaseId || item.leaseId !== leaseId || !allowed.has(item.status)) return null;
-  return item;
+  if (!item || !leaseId) return null;
+  if (item.usageMode === "shared") {
+    const attempt = sharedAttempts(item).find((entry) => entry.leaseId === leaseId);
+    if (!attempt || !allowed.has(attempt.status)) return null;
+    return { item, attempt };
+  }
+  if (item.leaseId !== leaseId || !allowed.has(item.status)) return null;
+  return { item, attempt: null };
 }
 
 function fillUnknownBindingEvidence(binding, evidence) {
@@ -613,10 +855,18 @@ function appendBinding(item, account, usedAt = nowIso(), completedLeaseId = "", 
     };
     item.bindings.push(binding);
   } else {
+    const wasActive = binding.active !== false;
     if (!binding.accountId && key.id) binding.accountId = key.id;
     if (!binding.email && key.email) binding.email = String(account && account.email || "").trim();
-    if (!binding.usedAt) binding.usedAt = usedAt;
-    if (!binding.completedLeaseId && completedLeaseId) binding.completedLeaseId = String(completedLeaseId);
+    // 已移除后重新绑定是一轮全新的成功：时间与完成 token 必须换成新 lease，
+    // 否则其它并发 claim 清掉根 token 后，新 lease 的幂等重放会无法识别。
+    if (!wasActive) {
+      binding.usedAt = usedAt;
+      binding.completedLeaseId = String(completedLeaseId || "");
+    } else {
+      if (!binding.usedAt) binding.usedAt = usedAt;
+      if (!binding.completedLeaseId && completedLeaseId) binding.completedLeaseId = String(completedLeaseId);
+    }
     fillUnknownBindingEvidence(binding, normalizedEvidence);
     binding.active = true;
     binding.removedAt = "";
@@ -643,10 +893,14 @@ function clearActiveLease(item) {
  * 该点击没有提交（例如 Next 只打开了 Save 确认框）后才能 clearSubmitIntent。
  */
 function markSubmitIntent(id, leaseId, reason = "即将提交手机号，等待页面结果") {
-  const item = validateLease(id, leaseId, new Set(["reserved"]));
-  if (!item || item.submittedAt) return null;
-  if (!item.submitIntentAt) item.submitIntentAt = nowIso();
-  item.lastError = String(reason || "");
+  const record = validateLease(id, leaseId, new Set(["reserved"]));
+  if (!record) return null;
+  const { item, attempt } = record;
+  const target = attempt || item;
+  if (target.submittedAt) return null;
+  if (!target.submitIntentAt) target.submitIntentAt = nowIso();
+  target.lastError = String(reason || "");
+  if (attempt) syncSharedProjection(item);
   item.updatedAt = nowIso();
   db.flushSync();
   return item;
@@ -654,24 +908,31 @@ function markSubmitIntent(id, leaseId, reason = "即将提交手机号，等待�
 
 /** 只有仍为 reserved、尚未真正提交的同一 lease 才能撤销预提交保护。 */
 function clearSubmitIntent(id, leaseId, reason = "") {
-  const item = validateLease(id, leaseId, new Set(["reserved"]));
-  if (!item || item.submittedAt) return null;
-  item.submitIntentAt = "";
-  item.lastError = String(reason || "");
+  const record = validateLease(id, leaseId, new Set(["reserved"]));
+  if (!record) return null;
+  const { item, attempt } = record;
+  const target = attempt || item;
+  if (target.submittedAt) return null;
+  target.submitIntentAt = "";
+  target.lastError = String(reason || "");
+  if (attempt) syncSharedProjection(item);
   item.updatedAt = nowIso();
   db.flushSync();
   return item;
 }
 
-/** 号码已提交/短信可能已发出；动作运行期间保持互斥，终态由共享/独享策略分别处理。 */
+/** 号码已提交/短信可能已发出；只锁定当前 lease，终态由共享/独享策略分别处理。 */
 function markPending(id, leaseId, reason = "手机号已提交，等待 Google 确认或生效") {
-  const item = validateLease(id, leaseId, new Set(["reserved", "pending"]));
-  if (!item) return null;
+  const record = validateLease(id, leaseId, new Set(["reserved", "pending"]));
+  if (!record) return null;
+  const { item, attempt } = record;
+  const target = attempt || item;
   const now = nowIso();
-  item.status = "pending";
-  if (!item.submitIntentAt) item.submitIntentAt = now;
-  if (!item.submittedAt) item.submittedAt = now;
-  item.lastError = String(reason || "");
+  target.status = "pending";
+  if (!target.submitIntentAt) target.submitIntentAt = now;
+  if (!target.submittedAt) target.submittedAt = now;
+  target.lastError = String(reason || "");
+  if (attempt) syncSharedProjection(item);
   item.updatedAt = now;
   db.flushSync();
   return item;
@@ -686,18 +947,34 @@ function confirmUsed(id, leaseId, evidence = {}) {
   const completedBefore = existing && leaseId && (Array.isArray(existing.bindings) ? existing.bindings : [])
     .some((binding) => binding.completedLeaseId === leaseId);
   if (existing && leaseId && (existing.completedLeaseId === leaseId || completedBefore)) return existing;
-  const item = validateLease(id, leaseId, new Set(["reserved", "pending"]));
-  if (!item) return null;
+  const record = validateLease(id, leaseId, new Set(["reserved", "pending"]));
+  if (!record) return null;
+  const { item, attempt } = record;
   const now = nowIso();
-  const account = { id: item.usedByAccountId, email: item.usedBy };
+  const account = attempt
+    ? { id: attempt.accountId, email: attempt.email }
+    : { id: item.usedByAccountId, email: item.usedBy };
   const binding = appendBinding(item, account, now, leaseId, normalizedEvidence);
-  item.status = "used";
+  if (attempt) {
+    item.attempts = sharedAttempts(item).filter((entry) => entry.leaseId !== leaseId);
+    bumpActiveRevision(item);
+    item.status = "used";
+    item.completedLeaseId = leaseId;
+    syncSharedProjection(item);
+    if (!item.attempts.length) {
+      item.usedByAccountId = binding.accountId;
+      item.usedBy = binding.email;
+      item.usedAt = binding.usedAt;
+    }
+  } else {
+    item.status = "used";
+    item.completedLeaseId = leaseId;
+    clearActiveLease(item);
+    item.usedByAccountId = binding.accountId;
+    item.usedBy = binding.email;
+    item.usedAt = binding.usedAt;
+  }
   item.lastError = "";
-  item.completedLeaseId = leaseId;
-  clearActiveLease(item);
-  item.usedByAccountId = binding.accountId;
-  item.usedBy = binding.email;
-  item.usedAt = binding.usedAt;
   item.updatedAt = now;
   db.flushSync();
   return item;
@@ -719,19 +996,27 @@ function confirmManualUsed(id, account, evidence = {
   const key = accountKey(account);
   if (!key.id || !key.email) throw new Error("人工确认手机号需要有效账号 id 和邮箱");
 
-  const active = ACTIVE_STATUSES.has(item.status);
-  if (active && !activeBelongsTo(item, account)) {
+  const matchingAttempt = activeAttemptForAccount(item, account);
+  const active = activeAttemptCount(item) > 0;
+  const existingBinding = bindingForAccount(item, account);
+  if (active && !matchingAttempt && !existingBinding) {
     throw stateConflict("该手机号当前正由另一个账号提交，不能人工确认");
   }
 
-  const existingBinding = bindingForAccount(item, account);
-  if (!active && existingBinding) {
+  if (existingBinding) {
     // 同账号重复确认幂等，同时修复旧状态为 used。
     fillUnknownBindingEvidence(existingBinding, normalizedEvidence);
-    item.status = "used";
-    item.usedByAccountId = existingBinding.accountId;
-    item.usedBy = existingBinding.email;
-    item.usedAt = existingBinding.usedAt;
+    if (item.usageMode === "shared" && matchingAttempt) {
+      item.attempts = sharedAttempts(item).filter((entry) => entry.leaseId !== matchingAttempt.leaseId);
+      bumpActiveRevision(item);
+      item.status = "used";
+      syncSharedProjection(item);
+    } else if (!active) {
+      item.status = "used";
+      item.usedByAccountId = existingBinding.accountId;
+      item.usedBy = existingBinding.email;
+      item.usedAt = existingBinding.usedAt;
+    }
     item.lastError = "";
     item.updatedAt = nowIso();
     db.flushSync();
@@ -746,13 +1031,27 @@ function confirmManualUsed(id, account, evidence = {
   }
 
   const now = nowIso();
-  const completedLeaseId = active ? item.leaseId : "";
+  const completedLeaseId = matchingAttempt ? matchingAttempt.leaseId : "";
   const binding = appendBinding(item, account, now, completedLeaseId, normalizedEvidence);
-  item.status = "used";
-  item.usedByAccountId = binding.accountId;
-  item.usedBy = binding.email;
-  item.usedAt = binding.usedAt;
-  clearActiveLease(item);
+  if (item.usageMode === "shared") {
+    if (matchingAttempt) {
+      item.attempts = sharedAttempts(item).filter((entry) => entry.leaseId !== matchingAttempt.leaseId);
+      bumpActiveRevision(item);
+    }
+    item.status = "used";
+    syncSharedProjection(item);
+    if (!item.attempts.length) {
+      item.usedByAccountId = binding.accountId;
+      item.usedBy = binding.email;
+      item.usedAt = binding.usedAt;
+    }
+  } else {
+    item.status = "used";
+    item.usedByAccountId = binding.accountId;
+    item.usedBy = binding.email;
+    item.usedAt = binding.usedAt;
+    clearActiveLease(item);
+  }
   item.completedLeaseId = completedLeaseId;
   item.lastError = "";
   item.updatedAt = now;
@@ -763,9 +1062,22 @@ function confirmManualUsed(id, account, evidence = {
 function markFailed(id, leaseId, reason) {
   // 此安全失败入口只处理尚未提交的 reserved。共享任务终态复用 releaseSharedAttempt；
   // 独享 pending / durable submit intent 则继续保护，等待人工核对。
-  const item = validateLease(id, leaseId, new Set(["reserved"]));
-  if (!item || item.submittedAt || item.submitIntentAt) return null;
-  item.lastError = String(reason || "Google 拒绝该手机号");
+  const record = validateLease(id, leaseId, new Set(["reserved"]));
+  if (!record) return null;
+  const { item, attempt } = record;
+  const target = attempt || item;
+  if (target.submittedAt || target.submitIntentAt) return null;
+  const error = String(reason || "Google 拒绝该手机号");
+  if (attempt) {
+    item.attempts = sharedAttempts(item).filter((entry) => entry.leaseId !== leaseId);
+    bumpActiveRevision(item);
+    syncSharedProjection(item);
+    item.lastError = error;
+    item.updatedAt = nowIso();
+    db.flushSync();
+    return item;
+  }
+  item.lastError = error;
   item.completedLeaseId = "";
   clearActiveLease(item);
   if (bindingCount(item) > 0) {
@@ -784,8 +1096,20 @@ function markFailed(id, leaseId, reason) {
 
 /** 独享安全释放：只允许尚未提交的 reserved；pending 永不经此入口自动回收。 */
 function release(id, leaseId, reason = "") {
-  const item = validateLease(id, leaseId, new Set(["reserved"]));
-  if (!item || item.submittedAt || item.submitIntentAt) return null;
+  const record = validateLease(id, leaseId, new Set(["reserved"]));
+  if (!record) return null;
+  const { item, attempt } = record;
+  const target = attempt || item;
+  if (target.submittedAt || target.submitIntentAt) return null;
+  if (attempt) {
+    item.attempts = sharedAttempts(item).filter((entry) => entry.leaseId !== leaseId);
+    bumpActiveRevision(item);
+    syncSharedProjection(item);
+    item.lastError = String(reason || "");
+    item.updatedAt = nowIso();
+    db.flushSync();
+    return item;
+  }
   clearActiveLease(item);
   item.completedLeaseId = "";
   item.lastError = String(reason || "");
@@ -804,13 +1128,18 @@ function release(id, leaseId, reason = "") {
 }
 
 /**
- * 共享号码只在单个账号任务运行期间互斥。任务一旦结束，无论 Google 成功、拒绝、
- * 超时或要求人工验证，都清掉 active lease，让下一个账号继续使用同一个号码。
+ * 共享号码每个账号有独立 attempt。任务一旦结束，无论 Google 成功、拒绝、
+ * 超时或要求人工验证，都只清掉本 lease，其它并发账号不受影响。
  */
 function releaseSharedAttempt(id, leaseId, reason = "共享号码本次尝试已结束") {
-  const item = validateLease(id, leaseId, ACTIVE_STATUSES);
-  if (!item || item.usageMode !== "shared") return null;
-  restoreAfterAttemptRelease(item, reason);
+  const record = validateLease(id, leaseId, ACTIVE_STATUSES);
+  if (!record || !record.attempt || record.item.usageMode !== "shared") return null;
+  const { item } = record;
+  item.attempts = sharedAttempts(item).filter((entry) => entry.leaseId !== leaseId);
+  bumpActiveRevision(item);
+  syncSharedProjection(item);
+  item.lastError = String(reason || "共享号码本次尝试已结束");
+  item.updatedAt = nowIso();
   db.flushSync();
   return item;
 }
@@ -818,15 +1147,27 @@ function releaseSharedAttempt(id, leaseId, reason = "共享号码本次尝试已
 function requireReleaseOptions(options) {
   if (options == null) return {};
   if (typeof options !== "object" || Array.isArray(options)) throw new Error("释放选项必须是对象");
-  const allowed = new Set(["reason", "expectedReservedAt", "allowFresh"]);
+  const allowed = new Set([
+    "reason", "expectedReservedAt", "expectedActiveRevision", "expectedActiveCount", "allowFresh",
+  ]);
   if (Object.keys(options).some((key) => !allowed.has(key))) throw new Error("释放选项包含不支持的字段");
   if (Object.prototype.hasOwnProperty.call(options, "allowFresh") && typeof options.allowFresh !== "boolean") {
     throw new Error("allowFresh 必须是布尔值");
+  }
+  for (const key of ["expectedActiveRevision", "expectedActiveCount"]) {
+    if (Object.prototype.hasOwnProperty.call(options, key)
+      && (!Number.isSafeInteger(options[key]) || options[key] < 0)) {
+      throw new Error(`${key} 必须是非负安全整数`);
+    }
   }
   return options;
 }
 
 function restoreAfterAttemptRelease(item, reason) {
+  if (item.usageMode === "shared" && sharedAttempts(item).length) {
+    item.attempts = [];
+    bumpActiveRevision(item);
+  }
   clearActiveLease(item);
   item.completedLeaseId = "";
   item.lastError = String(reason || "手机号本次账号占用已释放");
@@ -847,14 +1188,15 @@ function restoreAfterAttemptRelease(item, reason) {
  * 释放单条 active lease。
  * - 共享号码允许用户立即结束当前账号占用，不以成功/失败或是否已提交为前提；
  * - 一号一绑仅允许释放尚未提交且超过安全时限的 reserved；
- * - expectedReservedAt 防止旧页面误释放已经变化的新 lease；
+ * - shared 用 activeRevision + activeCount 校验整组 attempt 快照；
+ * - exclusive 用 expectedReservedAt 防止旧页面误释放已经变化的新 lease；
  * - 启动恢复传 allowFresh=true，因为新进程不会继续上一进程内存中的 job。
  */
 function releaseUnsubmittedReservation(id, options = {}) {
   const opts = requireReleaseOptions(options);
   const item = getById(id);
   if (!item) return null;
-  if (!ACTIVE_STATUSES.has(item.status)) throw stateConflict("只有占用中或待确认的号码可以释放");
+  if (activeAttemptCount(item) === 0) throw stateConflict("只有占用中或待确认的号码可以释放");
   const reusableShared = item.usageMode === "shared";
   if (!reusableShared && item.status !== "reserved") {
     throw stateConflict("一号一绑的待确认号码不能释放，请先人工核对结果");
@@ -862,7 +1204,17 @@ function releaseUnsubmittedReservation(id, options = {}) {
   if (!reusableShared && (item.submittedAt || item.submitIntentAt)) {
     throw stateConflict("该号码已有提交意图或可能已经提交，不能释放；请人工核对后确认结果");
   }
-  if (Object.prototype.hasOwnProperty.call(opts, "expectedReservedAt")
+  if (reusableShared) {
+    const hasRevision = Object.prototype.hasOwnProperty.call(opts, "expectedActiveRevision");
+    const hasCount = Object.prototype.hasOwnProperty.call(opts, "expectedActiveCount");
+    if (!hasRevision || !hasCount) {
+      throw stateConflict("共享号码占用快照已过期，请刷新手机号池后重试");
+    }
+    if (opts.expectedActiveRevision !== item.activeRevision
+      || opts.expectedActiveCount !== activeAttemptCount(item)) {
+      throw stateConflict("共享号码的并发占用已经变化，请刷新后重试");
+    }
+  } else if (Object.prototype.hasOwnProperty.call(opts, "expectedReservedAt")
     && String(opts.expectedReservedAt || "") !== String(item.reservedAt || "")) {
     throw stateConflict("手机号占用已经变化，请刷新后重试");
   }
@@ -892,9 +1244,9 @@ function recoverUnsubmittedReservations(options = {}) {
   }
   const reason = opts.reason || "服务重启后自动恢复手机号池可用状态";
   const candidates = list().filter((item) => (
-    item.usageMode === "shared" && ACTIVE_STATUSES.has(item.status)
+    item.usageMode === "shared" && activeAttemptCount(item) > 0
   ) || (
-    item.status === "reserved" && !item.submittedAt && !item.submitIntentAt
+    item.usageMode !== "shared" && item.status === "reserved" && !item.submittedAt && !item.submitIntentAt
   ));
   let toUnused = 0;
   let toUsed = 0;
@@ -914,8 +1266,9 @@ function update(id, patch) {
   const next = patch || {};
   const hasMode = Object.prototype.hasOwnProperty.call(next, "usageMode");
   const desiredMode = hasMode ? requireUsageMode(next.usageMode) : item.usageMode;
+  const hasActive = activeAttemptCount(item) > 0;
   if (hasMode && desiredMode !== item.usageMode) {
-    if (ACTIVE_STATUSES.has(item.status)) throw stateConflict("手机号有进行中的任务，不能切换共享/独享模式");
+    if (hasActive) throw stateConflict("手机号有进行中的任务，不能切换共享/独享模式");
     if (item.usageMode === "shared" && desiredMode === "exclusive" && bindingCount(item) > 1) {
       throw stateConflict("该共享手机号已绑定多个账号，不能切换为独享模式");
     }
@@ -923,7 +1276,7 @@ function update(id, patch) {
 
   let normalizedNumber = null;
   if (Object.prototype.hasOwnProperty.call(next, "number")) {
-    if (ACTIVE_STATUSES.has(item.status) || item.status === "used" || bindingCount(item) > 0) {
+    if (hasActive || item.status === "used" || bindingCount(item) > 0) {
       throw stateConflict("占用中或已有绑定历史的号码不能修改");
     }
     normalizedNumber = normalizeNumber(next.number);
@@ -937,10 +1290,10 @@ function update(id, patch) {
     if (!STATUSES.includes(desiredStatus)) throw new Error(`不支持的手机号状态：${desiredStatus}`);
     const allowed = manualStatusesFor(item);
     if (!allowed.includes(desiredStatus)) {
-      if ((desiredStatus === "reserved" || desiredStatus === "pending") && !ACTIVE_STATUSES.has(item.status)) {
+      if ((desiredStatus === "reserved" || desiredStatus === "pending") && !hasActive) {
         throw stateConflict("占用/待确认状态只能由添加手机号任务创建");
       }
-      if (ACTIVE_STATUSES.has(item.status)) {
+      if (hasActive) {
         throw stateConflict("手机号有进行中的任务，只能由持有 lease 的自动化动作推进");
       }
       if (bindingCount(item) > 0) {
@@ -1009,7 +1362,7 @@ function remove(ids, options = {}) {
   const items = list();
   const set = new Set(normalizedIds);
   const blocked = items.filter((item) => set.has(item.id) && (
-    ACTIVE_STATUSES.has(item.status)
+    activeAttemptCount(item) > 0
     || (!forceBound && (item.status === "used" || bindingCount(item) > 0))
   ));
   if (blocked.length) return { removed: 0, blocked: blocked.map((item) => item.id), total: items.length };
@@ -1040,6 +1393,7 @@ module.exports = {
   markAccountBindingsRemoved,
   toPublic,
   getById,
+  getAttempt,
   importText,
   update,
   remove,

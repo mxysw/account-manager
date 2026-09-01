@@ -5,9 +5,9 @@
  *
  * 安全边界：
  * - Add / Next(Send) 各阶段有限次，真正“发送短信”的提交只执行一次；
- * - 出现短信验证码框时绝不把账号 TOTP 填进去；共享任务直接结束并继续下一个账号；
+ * - 出现短信验证码框时绝不把账号 TOTP 填进去；共享任务直接结束当前账号；
  * - 只有成功提示或号码列表明确出现目标号码才记 used / phone=ok；
- * - 共享号码只在当前账号动作执行期间互斥，任一终态都会释放给下一个账号。
+ * - 共享号码的每个账号使用独立 attempt，任一终态只释放本账号，不影响其它并发任务。
  */
 
 const login = require("./login");
@@ -656,11 +656,35 @@ async function addPhone(page, account, ctx = {}) {
   }
 
   const { item, leaseId } = claim;
+  const leaseState = () => {
+    if (!item || !item.id || !leaseId) return null;
+    if (typeof pool.getAttempt === "function") return pool.getAttempt(item.id, leaseId);
+    const current = typeof pool.getById === "function" ? pool.getById(item.id) : item;
+    // 兼容旧测试注入池：只有顶层单 lease 时必须确认仍是本 runner 的 token。
+    return current && (!current.leaseId || current.leaseId === leaseId) ? current : null;
+  };
   let masked = "••••";
   let readOnly = false;
   let submitted = false;
   const finishSharedAttempt = (result, reason) => {
     if (phoneMode !== "shared") return result;
+    // pending 的重复任务只是观察者，不拥有原 runner 创建的 lease。观察未确认时
+    // 只能结束自己的浏览器，绝不能释放或改坏原任务仍在使用的 attempt。
+    const readOnlyObserver = claim.readOnly === true && claim.alreadyUsed !== true && !!leaseId;
+    if (readOnlyObserver) {
+      const detail = result && result.detail && typeof result.detail === "object" ? result.detail : {};
+      const observedDetail = String(detail.phoneAdd || "该号码仍在等待原提交任务确认").trim();
+      return {
+        ...result,
+        statusPatch: { ...(result.statusPatch || {}), phone: "pending" },
+        detail: {
+          ...detail,
+          phoneAdd: `${observedDetail}；本次为只读复查，未修改原任务的共享号码占用`,
+        },
+        keepOpen: false,
+        handoff: false,
+      };
+    }
     let releaseFailed = false;
     if (item && item.id && leaseId) {
       try {
@@ -669,9 +693,8 @@ async function addPhone(page, account, ctx = {}) {
         } else {
           const released = pool.releaseSharedAttempt(item.id, leaseId, reason || "共享号码本次账号尝试已结束");
           if (!released) {
-            const current = typeof pool.getById === "function" ? pool.getById(item.id) : item;
-            releaseFailed = !!(current && current.leaseId === leaseId
-              && (current.status === "reserved" || current.status === "pending"));
+            const current = leaseState();
+            releaseFailed = !!(current && (current.status === "reserved" || current.status === "pending"));
           }
         }
       } catch (_) {
@@ -700,8 +723,8 @@ async function addPhone(page, account, ctx = {}) {
       .replace(/[；，]?号码保持待确认/g, "")
       .trim();
     const phoneAdd = detail.phoneAdd
-      ? `${sharedDetail || "本账号的手机号添加任务已结束"}；共享号码已开放给下一个账号`
-      : "本账号的手机号添加任务已结束；共享号码已开放给下一个账号";
+      ? `${sharedDetail || "本账号的手机号添加任务已结束"}；本账号的共享号码占用已释放`
+      : "本账号的手机号添加任务已结束；本账号的共享号码占用已释放";
     return {
       ...result,
       statusPatch: { ...(result.statusPatch || {}), phone: result.outcome === "ok" ? "ok" : "failed" },
@@ -715,9 +738,12 @@ async function addPhone(page, account, ctx = {}) {
     masked = maskPhone(item.number);
     emit("phone_claimed", { poolId: item.id, last4: item.number.slice(-4), reused: !!claim.reused });
 
-    // pending 和 used 都只能只读复核。pool 新接口显式返回 readOnly；旧数据也按状态兜底。
+    // pending 和 used 都只能只读复核。共享并发必须读取本 lease 的 attempt，不能读取
+    // 手机号根对象的概览状态，否则别的账号 pending 会把当前新任务误判为只读。
+    const initialState = claim.attempt || leaseState() || (typeof pool.getAttempt !== "function" ? item : null);
     readOnly = claim.readOnly === true || claim.alreadyUsed === true
-      || item.status === "pending" || !!item.submittedAt || !!item.submitIntentAt;
+      || (initialState && (initialState.status === "pending"
+        || !!initialState.submittedAt || !!initialState.submitIntentAt));
     submitted = readOnly;
     let preliminaryIntent = false;
     let submitCallbackUsed = false;
@@ -765,7 +791,7 @@ async function addPhone(page, account, ctx = {}) {
 
     // Next 后若未能明确观察到“仅确认框”或正式提交结果，先升级为待核对；
     // 共享模式随后结束当前账号并释放号码，一号一绑则继续保守保护。
-    const afterDrive = pool.getById ? pool.getById(item.id) : null;
+    const afterDrive = leaseState();
     if (!readOnly && !result.submitted && afterDrive && afterDrive.status === "reserved" && afterDrive.submitIntentAt) {
       const marked = pool.markPending(item.id, leaseId, result.detail || "Next 后页面状态不明确，等待人工核对");
       if (marked) {
@@ -884,7 +910,7 @@ async function addPhone(page, account, ctx = {}) {
         `共享号码只读复核异常：${err.message}`,
       );
     }
-    const current = item && item.id && pool.getById ? pool.getById(item.id) : null;
+    const current = leaseState();
     const isPending = submitted || (current && (current.status === "pending" || current.submitIntentAt));
     if (isPending) {
       pool.markPending(item.id, leaseId, `提交后页面异常：${err.message}`);
