@@ -67,6 +67,8 @@ function harness({ storage = new Map(), server = { configured: false } } = {}) {
   };
   const controller = new Function(...Object.keys(deps), `
     let appReady = true, jobStarting = false, jobId = null, cancelInFlight = false;
+    let adspowerSettingsLoaded = true, adspowerConfigured = true, adspowerSettingsBusy = false;
+    let adspowerEnvsReady = true;
     let closeTargetId = null, trackedJob = null, cancelIntent = false;
     let cancelError = "", jobPollError = "", jobStateEpoch = 0;
     const envSelected = new Set(["fixture-env"]), accounts = [], jobManualExpand = new Map();

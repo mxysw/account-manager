@@ -16,10 +16,37 @@ const capsolver = require("./capsolver");
  * 注意：本引擎假设环境里“已登录目标账号”（登录动作可单独实现后接入）。
  */
 const jobs = new Map();
+let tempLedgerInstance = null;
+function tempLedger() {
+  if (!tempLedgerInstance) {
+    const { createLedger } = require("./adspower-temp-ledger");
+    tempLedgerInstance = createLedger();
+  }
+  return tempLedgerInstance;
+}
 // AdsPower serial 是跨 job 共享的真实浏览器环境。只靠 job 内的 env.busy 无法阻止
 // 另一个任务复用同一 serial 并在启动前 ads.stop，因此在进程内做全局占用。
 const adsSerialOwners = new Map();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let tempApiGate = Promise.resolve();
+let tempApiLastCall = 0;
+
+// AdsPower limits Local API call frequency. Space temporary-profile requests
+// across jobs without reducing the number of browsers that can run in parallel.
+async function tempApiCall(work, signal = null) {
+  let release;
+  const turn = new Promise((resolve) => { release = resolve; });
+  const previous = tempApiGate;
+  tempApiGate = turn;
+  await previous;
+  try {
+    const delay = Math.max(0, tempApiLastCall + 1100 - Date.now());
+    if (delay) await sleep(delay);
+    if (signal && signal.aborted) throw cancelledError();
+    tempApiLastCall = Date.now();
+  } finally { release(); }
+  return work();
+}
 
 const LOCAL_LAUNCH_ATTEMPTS = 2;
 const LOCAL_CONNECT_ATTEMPTS = 4;
@@ -100,14 +127,49 @@ function pendingEnvironmentRequest(job, env, work) {
   });
 }
 
+function confirmedAdsStop(result) {
+  return !!result && (result.code != null ? result.code === 0 : result.ok === true);
+}
+
+async function confirmAdsInactive(ads, serial, request) {
+  // stop 的成功响应只表示请求被接受；以 active 的 Inactive 状态确认窗口已关闭。
+  // Local API 有调用频率限制，状态查询与 stop 及相邻轮询至少间隔一秒。
+  await sleep(1000);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const result = await request(() => ads.status(serial));
+    if (result && result.code === 0 && result.data && result.data.status === "Inactive") return;
+    if (!result || result.code !== 0 || !result.data || result.data.status !== "Active") {
+      throw new Error("AdsPower 窗口状态未确认，请重试关闭");
+    }
+    if (attempt < 7) await sleep(1000);
+  }
+  throw new Error("AdsPower 窗口仍处于打开状态，请重试关闭");
+}
+
+async function confirmTempProfileInactive(ads, profileId, request) {
+  // A successful stop request is not proof that the browser process exited.
+  await sleep(1000);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const result = await request(() => tempApiCall(() => ads.profileStatus(profileId)));
+    if (result && result.status === "Inactive") return;
+    if (!result || result.status !== "Active") throw new Error("临时环境关闭状态未确认，未移入回收站");
+    if (attempt < 7) await sleep(1000);
+  }
+  throw new Error("临时环境仍在运行，未移入回收站");
+}
+
 function closeEnvironment(job, env, retry = false) {
   if (env.closePromise) return env.closePromise;
   if (env.closeError && !retry) return Promise.resolve(false);
   const local = env.local;
   const session = env.session;
-  const stopAds = job.mode !== "local" && !!env.needsStop;
+  const stopAds = job.mode === "adspower" && !!env.needsStop;
+  const tempProfileId = job.mode === "adspower_temp" ? env.tempProfileId : null;
+  // A create/start call can complete after cancellation. Do not delete a profile
+  // until the late response has been adopted and its exact ID journaled.
+  if (job.mode === "adspower_temp" && env.pendingResources) return Promise.resolve(false);
   const resourceVersion = env.resourceVersion;
-  if (!local && !session && !stopAds) {
+  if (!local && !session && !stopAds && !tempProfileId) {
     if (!env.closeError) env.retained = false;
     return Promise.resolve(!env.closeError);
   }
@@ -120,11 +182,48 @@ function closeEnvironment(job, env, retry = false) {
     try {
       if (local) await bounded(() => local.stop(), 10000, "浏览器进程关闭超时，请重试");
       else if (stopAds) {
-        const ads = new AdsPower({ apiKey: job.apiKey });
-        const result = await bounded(() => pendingEnvironmentRequest(job, env, () => ads.stop(env.serial)), 15000, "AdsPower 关闭超时，请重试");
-        if (!result || (result.code != null ? result.code !== 0 : result.ok !== true)) {
-          throw new Error((result && (result.error || result.message || result.msg)) || "AdsPower 未确认关闭成功，请重试");
+        const ads = new AdsPower({ apiKey: job.apiKey, base: job.adsBase });
+        let stopResult;
+        let stopError;
+        try {
+          stopResult = await bounded(() => pendingEnvironmentRequest(job, env, () => ads.stop(env.serial)), 15000, "AdsPower 关闭超时，请重试");
+        } catch (error) { stopError = error; }
+        try {
+          await confirmAdsInactive(ads, env.serial, (work) => bounded(
+            () => pendingEnvironmentRequest(job, env, work), 3000, "AdsPower 窗口状态查询超时，请重试",
+          ));
+        } catch (statusError) {
+          const stopMessage = stopError ? stopError.message
+            : !confirmedAdsStop(stopResult) && stopResult && (stopResult.error || stopResult.message || stopResult.msg);
+          throw new Error(stopMessage ? `${stopMessage}；${statusError.message}` : statusError.message);
         }
+      } else if (tempProfileId) {
+        const ledger = job.tempLedger;
+        const record = ledger.listOwned().find((item) => item.nonce === env.tempNonce && item.profileId === tempProfileId);
+        if (!record) throw new Error("临时环境所有权记录不匹配，未删除；请手动核查");
+        const ads = new AdsPower({
+          apiKey: job.apiKey, base: job.adsBase,
+          ownedProfileIds: ledger.listOwned().map((item) => item.profileId),
+        });
+        const request = (work, timeoutMessage) => bounded(
+          () => pendingEnvironmentRequest(job, env, work), 60000, timeoutMessage,
+        );
+        let status = await request(() => tempApiCall(() => ads.profileStatus(tempProfileId)), "临时环境状态查询超时");
+        if (status.status === "Active") {
+          await request(() => tempApiCall(() => ads.stopProfile(tempProfileId)), "临时环境关闭超时");
+          await confirmTempProfileInactive(ads, tempProfileId, (work) => request(work, "临时环境状态查询超时"));
+        } else if (status.status !== "Inactive") {
+          throw new Error("临时环境状态未知，未移入回收站");
+        }
+        ledger.markClosed(env.tempNonce);
+        const candidateId = ledger.deletionCandidate(env.tempNonce);
+        if (candidateId !== tempProfileId) throw new Error("临时环境删除目标不匹配");
+        await request(() => tempApiCall(() => ads.deleteProfile(candidateId)), "移入 AdsPower 回收站超时，请核查环境");
+        ledger.markDeleted(env.tempNonce);
+        const ownerTask = job.tasks.find((item) => item.id === record.taskId);
+        if (ownerTask) ownerTask.cleanupState = "trashed";
+        env.tempProfileId = null;
+        env.tempNonce = null;
       }
       await disconnect;
       if (env.local === local) env.local = null;
@@ -135,6 +234,11 @@ function closeEnvironment(job, env, retry = false) {
     } catch (error) {
       env.closeError = sanitizeTotpSetupValue(error.message || "窗口关闭失败，请重试");
       env.retained = true;
+      if (job.mode === "adspower_temp" && env.tempNonce) {
+        const record = job.tempLedger.get(env.tempNonce);
+        const ownerTask = record && job.tasks.find((item) => item.id === record.taskId);
+        if (ownerTask) ownerTask.cleanupState = "failed";
+      }
       return false;
     }
   })().finally(() => { env.closePromise = null; });
@@ -315,6 +419,8 @@ function publicJob(job) {
       email: t.email,
       env: t.env,
       status: t.status,
+      cleanupState: t.cleanupState || "",
+      cleanupMarker: t.cleanupMarker || "",
       captcha: t.captcha || null,
       windowWarning: t.windowWarning || "",
       results: t.results.map((result) => publicActionResult(result)),
@@ -356,7 +462,7 @@ function reserveAdsSerials(jobId, serials) {
 }
 
 function releaseAdsSerial(job, env, force = false) {
-  if (!job || job.mode === "local" || !env) return false;
+  if (!job || job.mode !== "adspower" || !env) return false;
   if (!force && (env.retained || env.busy || env.pendingResources || env.closePromise || env.needsStop)) return false;
   if (adsSerialOwners.get(env.serial) !== job.id) return false;
   adsSerialOwners.delete(env.serial);
@@ -364,7 +470,7 @@ function releaseAdsSerial(job, env, force = false) {
 }
 
 function releaseFinishedAdsSerials(job) {
-  if (!job || job.mode === "local") return;
+  if (!job || job.mode !== "adspower") return;
   job.envs.forEach((env) => releaseAdsSerial(job, env, false));
 }
 
@@ -591,7 +697,11 @@ async function runTask(job, env, task) {
   };
   if (job.captchaSolver) accountCaptchaSolver = job.captchaSolver.forAccount(task.accountId, { emit });
   const isLocal = job.mode === "local";
-  const ads = isLocal ? null : new AdsPower({ apiKey: job.apiKey });
+  const isTempAds = job.mode === "adspower_temp";
+  const ads = isLocal ? null : new AdsPower({
+    apiKey: job.apiKey, base: job.adsBase,
+    ...(isTempAds ? { ownedProfileIds: job.tempLedger.listOwned().map((item) => item.profileId) } : {}),
+  });
   let session = null;
   let activeActionId = null;
   let keepOpenRequested = false;
@@ -625,44 +735,68 @@ async function runTask(job, env, task) {
       env.local = opened.local;
       session = opened.session;
       windowOpened = true;
+    } else if (isTempAds) {
+      // Only the returned profile ID may be used for subsequent calls/deletion.
+      // The nonce is journaled before the external create request, so an
+      // ambiguous response can be investigated without guessing an ID.
+      const intent = job.tempLedger.begin(job.id, task.id);
+      env.tempNonce = intent.nonce;
+      task.cleanupMarker = intent.nonce;
+      emit("temp_profile_creating", { env: env.serial });
+      const created = await step(() => track(
+        () => tempApiCall(() => ads.createTempProfile({ marker: intent.nonce }), job.abortController.signal),
+        (value) => {
+          env.tempProfileId = value.profileId;
+          job.tempLedger.recordProfile(intent.nonce, value.profileId);
+        },
+      ));
+      if (!created || !created.profileId) throw new Error("AdsPower 未返回临时环境 ID，未继续启动");
+      emit("temp_profile_created", { env: env.serial });
+      env.needsStop = true;
+      const opened = await step(() => track(
+        () => tempApiCall(() => ads.startProfile(created.profileId), job.abortController.signal),
+        () => { env.needsStop = true; },
+      ));
+      windowOpened = true;
+      if (!opened || !opened.cdpEndpoint) throw new Error("AdsPower 临时环境未返回调试地址");
+      session = await step(() => connectSession(opened.cdpEndpoint, env, job.abortController.signal, () => job.cancelled, browser.connect, { background: job.background, onBackgroundWarning }));
     } else {
-      // 开窗口前处理代理（需先关窗，改动才能在重开后生效）：
-      //  - 勾选：从代理池绑一条住宅（每开一个号换一个新住宅 IP）
-      //  - 未勾选：把环境已有代理清成无代理（直连）
+      // 仅在明确选择代理池时改动代理；未选择时沿用环境已有配置。
       {
         env.needsStop = true;
-        try { await adsStep(() => ads.stop(env.serial)); } catch (_) { /* cancellation is checked by next step */ }
-        await step(() => sleep(500));
+        // 已关的环境可能拒绝重复 stop；实际状态为 Inactive 即可继续。
+        await adsStep(() => ads.stop(env.serial));
+        await confirmAdsInactive(ads, env.serial, adsStep);
+        await step(() => sleep(1000));
         if (job.proxy && job.proxy.enabled) {
           if (Array.isArray(job.proxy.proxyIds) && job.proxy.proxyIds.length) {
             // 按标签筛过的代理池：从该标签里随机挑一条绑上。
             const pid = job.proxy.proxyIds[Math.floor(Math.random() * job.proxy.proxyIds.length)];
             emit("setting_proxy", { env: env.serial, mode: "pool-tag", proxyId: pid });
             const pr = await adsStep(() => ads.bindProxyId(env.serial, pid));
-            emit(pr.ok ? "proxy_set" : "proxy_set_failed", pr);
+            emit(pr && pr.ok ? "proxy_set" : "proxy_set_failed", pr || {});
+            if (!pr || !pr.ok) throw new Error((pr && pr.msg) || "AdsPower 代理配置失败，已停止开窗");
           } else {
             // 整个代理池随机绑一条住宅。
             emit("setting_proxy", { env: env.serial, mode: "pool" });
             const pr = await adsStep(() => ads.bindRandomProxy(env.serial));
-            emit(pr.ok ? "proxy_set" : "proxy_set_failed", pr);
+            emit(pr && pr.ok ? "proxy_set" : "proxy_set_failed", pr || {});
+            if (!pr || !pr.ok) throw new Error((pr && pr.msg) || "AdsPower 代理配置失败，已停止开窗");
           }
-        } else {
-          // 未勾选动态住宅：清除环境已有代理，保证直连无代理。
-          emit("clearing_proxy", { env: env.serial });
-          const pr = await adsStep(() => ads.setProxy(env.serial, { proxy_soft: "no_proxy" }));
-          emit(pr.ok ? "proxy_cleared" : "proxy_clear_failed", pr);
+          await step(() => sleep(1000));
         }
-        await step(() => sleep(500));
       }
 
       // 开窗口前：确保关闭（让随机指纹生效）+ 随机指纹。
       if (job.randomFp) {
-        try { await adsStep(() => ads.stop(env.serial)); } catch (_) { /* cancellation is checked by next step */ }
-        await step(() => sleep(800));
+        await adsStep(() => ads.stop(env.serial));
+        await confirmAdsInactive(ads, env.serial, adsStep);
+        await step(() => sleep(1000));
         emit("randomizing_fingerprint", { env: env.serial });
         const fp = await adsStep(() => ads.randomizeFingerprint(env.serial));
-        emit(fp.ok ? "fingerprint_randomized" : "fingerprint_failed", fp);
-        await step(() => sleep(500));
+        emit(fp && fp.ok ? "fingerprint_randomized" : "fingerprint_failed", fp || {});
+        if (!fp || !fp.ok) throw new Error((fp && fp.msg) || "AdsPower 指纹配置失败，已停止开窗");
+        await step(() => sleep(1000));
       }
 
       emit("opening_env", { env: env.serial, clearCache: !!job.clearData });
@@ -784,6 +918,7 @@ async function runTask(job, env, task) {
         }
         // 保留环境不能复用，否则后续账号会关掉人工处理中的窗口。
         if (!job.cancelled) env.retained = true;
+        if (isTempAds) task.cleanupState = "retained";
         emit("env_kept_open", { env: env.serial });
       } else if (session && job.clearData && !job.cancelled) {
         // 正常收尾允许清理数据；主动停止不等待卡住的清理/CDP 操作。
@@ -796,6 +931,9 @@ async function runTask(job, env, task) {
       // 保留窗口流程中也可能收到取消，必须重新检查，不能用进入 finally 时的旧决定。
       if (job.cancelled || !keepThisTaskOpen) {
         const closed = await closeEnvironment(job, env);
+        if (isTempAds && !task.cleanupState) {
+          task.cleanupState = env.tempNonce ? "unconfirmed" : "not_created";
+        }
         emit(closed ? "env_closed" : "env_close_failed", { env: env.serial, message: env.closeError || "" });
       }
     }
@@ -843,7 +981,7 @@ function summarizeForLabel(task) {
   return lines;
 }
 
-function createJob({ apiKey, envSerials, accountIds, actionIds, maxConcurrent, targets, randomFp, clearData, keepOpen, background, manualChallengePolicy, proxy, mode, phoneMode, captchaSolver: captchaOptions }) {
+function createJob({ apiKey, adsBase, envSerials, accountIds, actionIds, maxConcurrent, targets, randomFp, clearData, keepOpen, background, manualChallengePolicy, proxy, mode, phoneMode, captchaSolver: captchaOptions }) {
   const selectedActionIds = actions.normalizeSelection(actionIds);
   const actionError = actions.validateSelection(selectedActionIds);
   if (actionError) throw new Error(actionError);
@@ -852,7 +990,11 @@ function createJob({ apiKey, envSerials, accountIds, actionIds, maxConcurrent, t
     throw new Error("手机号使用模式无效：只能是 shared 或 exclusive");
   }
   const id = genId();
-  const runMode = mode === "local" ? "local" : "adspower";
+  const runMode = mode === "local" || mode === "adspower" || mode === "adspower_temp"
+    ? mode : "adspower";
+  // A running job must keep using the connection it started with. Settings may
+  // be changed while it runs; never pair its old key with a newly saved port.
+  const pinnedAdsBase = runMode !== "local" ? new AdsPower({ apiKey, base: adsBase }).base : null;
   const challengePolicy = normalizeManualChallengePolicy(manualChallengePolicy);
   const captchaConfig = capsolver.normalizeConfig(captchaOptions, { accountCount: accountIds.length, actionIds: selectedActionIds, proxy });
   if (challengePolicy === "solve_close" && !captchaConfig) throw new Error("自动打码模式需要启用 CAPSOLVER 并保存 API Key");
@@ -874,28 +1016,32 @@ function createJob({ apiKey, envSerials, accountIds, actionIds, maxConcurrent, t
   });
   // 本机模式没有 AdsPower 环境序号：把「并发数」当作 N 个本地 slot，
   // 每个 slot 是一个占位 env（serial 仅作展示），跑任务时各自启动一个临时浏览器。
-  const adsSerials = runMode === "local" ? [] : normalizeAdsSerials(envSerials);
-  const envs = runMode === "local"
-    ? Array.from({ length: concurrent }, (_, i) => ({ serial: `本地#${i + 1}`, busy: false, retained: false, local: null }))
-    : adsSerials.map((serial) => ({ serial, busy: false, retained: false }));
+  const adsSerials = runMode === "adspower" ? normalizeAdsSerials(envSerials) : [];
+  const envs = runMode === "adspower"
+    ? adsSerials.map((serial) => ({ serial, busy: false, retained: false }))
+    : Array.from({ length: concurrent }, (_, i) => ({
+      serial: `${runMode === "local" ? "本地" : "临时"}#${i + 1}`,
+      busy: false, retained: false, local: null,
+    }));
   const job = {
     id,
     mode: runMode,
     background: background === true,
     phoneMode: selectedPhoneMode,
     apiKey,
+    adsBase: pinnedAdsBase,
     createdAt: new Date().toISOString(),
     actionIds: selectedActionIds,
     targets: targets || null,
     // 本机模式没有 AdsPower 指纹概念，randomFp 不适用，固定为 false。
-    randomFp: runMode === "local" ? false : randomFp !== false,
+    randomFp: runMode === "adspower" ? randomFp !== false : false,
     clearData: clearData !== false,
     requestedKeepOpen: !!keepOpen,
     keepOpen: challengePolicy !== "solve_close" && normalizeJobKeepOpen(selectedActionIds, keepOpen),
     manualChallengePolicy: challengePolicy,
     // proxy：AdsPower 代理池字段（enabled/tagId/proxyIds）保持原样；
     // 本机模式预留 proxy.server（规划中，透传给 --proxy-server，UI 暂未对接）。
-    proxy: runMode === "local"
+    proxy: runMode === "adspower_temp" ? null : runMode === "local"
       ? (proxy && proxy.server ? { server: String(proxy.server) } : null)
       : (proxy && proxy.enabled ? {
         enabled: true,
@@ -908,8 +1054,9 @@ function createJob({ apiKey, envSerials, accountIds, actionIds, maxConcurrent, t
     status: "running",
     abortController: new AbortController(),
   };
+  if (runMode === "adspower_temp") job.tempLedger = tempLedger();
   if (captchaConfig) job.captchaSolver = capsolver.createSolver(captchaConfig, { signal: job.abortController.signal });
-  if (runMode !== "local") reserveAdsSerials(id, adsSerials);
+  if (runMode === "adspower") reserveAdsSerials(id, adsSerials);
   jobs.set(id, job);
   try {
     schedule(job);

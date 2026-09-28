@@ -66,6 +66,7 @@ function engineFixture(options = {}) {
       return { cdpEndpoint: `fixture://ads/${serial}` };
     }
     async stop() { calls.adsStop += 1; return { ok: true }; }
+    async status() { return { code: 0, data: { status: "Inactive" } }; }
     async setProxy() { return { ok: true }; }
     async bindProxyId() { return { ok: true }; }
     async bindRandomProxy() { return { ok: true }; }
@@ -144,6 +145,7 @@ async function requestRun(body) {
     },
     "./automation/adspower": { AdsPower: class {} }, "./automation/ads-cli": {},
     "./automation/time-sync": {}, "./capsolver-settings": { resolveConfig: () => null },
+    "./adspower-settings": { getBase: () => "http://127.0.0.1:50325", getPort: () => 50325, validPort: (port) => Number(port) },
   };
   const module = { exports: {} };
   vm.runInNewContext(routerSource, {
@@ -327,6 +329,7 @@ module.exports = async function runBackgroundEngineTests({ checkAsync }) {
     vm.runInNewContext(adsSource, {
       module, exports: module.exports, URL,
       require: (name) => {
+        if (name === "../adspower-settings") return { getBase: () => "http://127.0.0.1:50325", getPort: () => 50325, validPort: (port) => Number(port) };
         assert.strictEqual(name, "http");
         return { request: () => { throw new Error("禁止真实 AdsPower HTTP 请求"); } };
       },

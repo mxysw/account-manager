@@ -40,8 +40,9 @@ async function cancelSettled(f, job) {
 }
 
 function engineFixture(options = {}) {
-  const calls = { starts: 0, connects: 0, localStops: 0, adsStarts: 0, adsStops: 0, adsProxyChanges: 0,
-    closes: 0, disconnects: 0, wipes: 0, labels: 0, actions: [], writes: [] };
+  const calls = { starts: 0, connects: 0, localStops: 0, adsStarts: 0, adsStops: 0, adsStatuses: 0,
+    adsProxyChanges: 0, adsProxyBinds: 0, adsFingerprints: 0,
+    closes: 0, disconnects: 0, wipes: 0, labels: 0, actions: [], writes: [], adsClients: [] };
   const records = new Map(["first", "second"].map((id) => [id, {
     id, email: `${id}@cancel-fixture.example`, password: "fixture-only-password", status: { login: "unknown" },
   }]));
@@ -84,6 +85,11 @@ function engineFixture(options = {}) {
     },
   };
   class AdsPower {
+    constructor(opts = {}) {
+      this.base = opts.base || (typeof options.adsBase === "function" ? options.adsBase() : options.adsBase)
+        || "http://127.0.0.1:50325";
+      calls.adsClients.push({ base: this.base, apiKey: opts.apiKey });
+    }
     async start(serial) {
       calls.adsStarts += 1;
       return options.adsStart ? options.adsStart(serial, calls) : { cdpEndpoint: `fixture://ads/${serial}` };
@@ -93,13 +99,26 @@ function engineFixture(options = {}) {
       if (options.adsStop) return options.adsStop(serial, calls);
       return { ok: true };
     }
+    async status(serial) {
+      calls.adsStatuses += 1;
+      return options.adsStatus ? options.adsStatus(serial, calls) : { code: 0, data: { status: "Inactive" } };
+    }
     async setProxy(serial, proxy) {
       calls.adsProxyChanges += 1;
       return options.adsSetProxy ? options.adsSetProxy(serial, proxy, calls) : { ok: true };
     }
-    async bindProxyId() { return { ok: true }; }
-    async bindRandomProxy() { return { ok: true }; }
-    async randomizeFingerprint() { return { ok: true }; }
+    async bindProxyId(serial, proxyId) {
+      calls.adsProxyBinds += 1;
+      return options.adsBindProxyId ? options.adsBindProxyId(serial, proxyId, calls) : { ok: true };
+    }
+    async bindRandomProxy(serial) {
+      calls.adsProxyBinds += 1;
+      return options.adsBindRandomProxy ? options.adsBindRandomProxy(serial, calls) : { ok: true };
+    }
+    async randomizeFingerprint(serial) {
+      calls.adsFingerprints += 1;
+      return options.adsRandomizeFingerprint ? options.adsRandomizeFingerprint(serial, calls) : { ok: true };
+    }
   }
   const store = {
     getById: (id) => records.get(id) || null,
@@ -776,6 +795,98 @@ module.exports = async function runCancelEngineTests({ checkAsync }) {
     assert.strictEqual(f.calls.localStops, 1);
   });
 
+  await checkAsync("AdsPower 未选择代理池时保留环境原有代理配置", async () => {
+    const f = engineFixture();
+    const job = f.create({ mode: "adspower", envSerials: ["fixture-ads-existing-proxy"] });
+    await until(() => job.status === "done", "沿用现有代理的任务完成");
+    assert.strictEqual(f.calls.adsProxyChanges, 0);
+    assert.strictEqual(f.calls.adsProxyBinds, 0);
+    assert.strictEqual(f.calls.adsStarts, 1);
+    assert.strictEqual(f.calls.actions.length, 1);
+    assert.ok(f.calls.adsStatuses >= 2, "开窗前和关窗后均须确认状态");
+  });
+
+  await checkAsync("AdsPower 运行中变更设置仍使用任务启动时的连接关闭窗口", async () => {
+    let currentBase = "http://127.0.0.1:50360";
+    const actionStarted = deferred();
+    const finishAction = deferred();
+    const f = engineFixture({ adsBase: () => currentBase, action: async () => {
+      actionStarted.resolve();
+      await finishAction.promise;
+      return { outcome: "ok", detail: {} };
+    } });
+    const job = f.create({ mode: "adspower", apiKey: "fixture-original-key",
+      envSerials: ["fixture-ads-connection-snapshot"] });
+    await actionStarted.promise;
+    currentBase = "http://127.0.0.1:50361";
+    finishAction.resolve();
+    await until(() => job.status === "done", "变更设置后的旧任务完成");
+    assert.strictEqual(job.adsBase, "http://127.0.0.1:50360");
+    assert.ok(f.calls.adsClients.length >= 3);
+    assert.ok(f.calls.adsClients.every(({ base, apiKey }) =>
+      base === "http://127.0.0.1:50360" && apiKey === "fixture-original-key"));
+  });
+
+  await checkAsync("AdsPower 环境已关闭时不因重复 stop 返回失败而阻止开窗", async () => {
+    const f = engineFixture({ adsStop: (_serial, calls) => calls.adsStops === 1
+      ? { code: -1, msg: "fixture already inactive" } : { code: 0 } });
+    const job = f.create({ mode: "adspower", envSerials: ["fixture-ads-already-inactive"] });
+    await until(() => job.status === "done", "已关闭环境任务完成");
+    assert.strictEqual(f.calls.adsStarts, 1);
+    assert.strictEqual(f.calls.actions.length, 1);
+    assert.strictEqual(f.engine.publicJob(job).closeErrors.length, 0);
+  });
+
+  await checkAsync("AdsPower 显式代理或指纹配置失败时不得开窗执行动作", async () => {
+    for (const config of [
+      { options: { proxy: { enabled: true } }, failure: { adsBindRandomProxy: () => ({ ok: false, msg: "fixture proxy rejected" }) }, event: "proxy_set_failed" },
+      { options: { proxy: { enabled: true, proxyIds: ["fixture-proxy"] } }, failure: { adsBindProxyId: () => ({ ok: false, msg: "fixture selected proxy rejected" }) }, event: "proxy_set_failed" },
+      { options: { randomFp: true }, failure: { adsRandomizeFingerprint: () => ({ ok: false, msg: "fixture fingerprint rejected" }) }, event: "fingerprint_failed" },
+    ]) {
+      const f = engineFixture(config.failure);
+      const job = f.create({ mode: "adspower", envSerials: ["fixture-ads-config-fail"], ...config.options });
+      await until(() => job.status === "done", "配置失败任务结束");
+      assert.strictEqual(f.calls.adsStarts, 0);
+      assert.strictEqual(f.calls.actions.length, 0);
+      assert.ok(job.tasks[0].events.some(({ type }) => type === config.event));
+      assert.strictEqual(f.engine.publicJob(job).closeErrors.length, 0);
+    }
+  });
+
+  await checkAsync("AdsPower 关闭响应成功后仍须等待状态变为 Inactive", async () => {
+    const f = engineFixture({ adsStatus: (_serial, calls) => ({ code: 0, data: {
+      status: calls.adsStatuses === 2 ? "Active" : "Inactive",
+    } }) });
+    const job = f.create({ mode: "adspower", envSerials: ["fixture-ads-active-then-inactive"] });
+    await until(() => job.status === "done", "关闭状态轮询完成");
+    assert.ok(f.calls.adsStatuses >= 3);
+    assert.strictEqual(job.envs[0].retained, false);
+    assert.strictEqual(f.engine.publicJob(job).closeErrors.length, 0);
+    const next = f.create({ mode: "adspower", envSerials: ["fixture-ads-active-then-inactive"], accountIds: ["second"] });
+    await until(() => next.status === "done", "确认关窗后环境可复用");
+  });
+
+  await checkAsync("AdsPower 状态持续 Active 或查询失败时不释放环境所有权", async () => {
+    for (const unresolved of ["Active", "unknown"]) {
+      let allowInactive = false;
+      const f = engineFixture({ adsStatus: (_serial, calls) => {
+        if (calls.adsStatuses === 1 || allowInactive) return { code: 0, data: { status: "Inactive" } };
+        return unresolved === "Active" ? { code: 0, data: { status: "Active" } } : { code: -1, data: {} };
+      } });
+      const options = { mode: "adspower", envSerials: [`fixture-ads-unconfirmed-${unresolved}`] };
+      const job = f.create(options);
+      await until(() => job.status === "done", "关闭状态未确认的任务结束");
+      assert.strictEqual(job.envs[0].retained, true);
+      assert.ok(f.engine.publicJob(job).closeErrors.length > 0);
+      assert.throws(() => f.create({ ...options, accountIds: ["second"] }), /另一个任务使用或保留/);
+      allowInactive = true;
+      await f.engine.cancelJob(job.id);
+      await cancelSettled(f, job);
+      assert.strictEqual(job.envs[0].retained, false);
+      assert.strictEqual(f.engine.publicJob(job).closeErrors.length, 0);
+    }
+  });
+
   await checkAsync("取消任务：AdsPower 动作阻塞时调用 AdsPower 关闭，不调用本机停止", async () => {
     const f = engineFixture({ action: () => new Promise(() => {}) });
     const job = f.create({ mode: "adspower", envSerials: ["fixture-ads-1"] });
@@ -835,11 +946,11 @@ module.exports = async function runCancelEngineTests({ checkAsync }) {
 
   await checkAsync("取消任务：AdsPower 代理设置迟到时持有环境直到请求结束且不再开窗", async () => {
     const changingProxy = deferred();
-    const f = engineFixture({ adsSetProxy: async (serial, proxy, calls) => calls.adsProxyChanges === 1
+    const f = engineFixture({ adsBindRandomProxy: async (serial, calls) => calls.adsProxyBinds === 1
       ? changingProxy.promise : { ok: true } });
-    const options = { mode: "adspower", envSerials: ["fixture-ads-proxy-pending"] };
+    const options = { mode: "adspower", envSerials: ["fixture-ads-proxy-pending"], proxy: { enabled: true } };
     const job = f.create(options);
-    await until(() => f.calls.adsProxyChanges === 1, "代理修改请求已发起");
+    await until(() => f.calls.adsProxyBinds === 1, "代理修改请求已发起");
     await f.engine.cancelJob(job.id);
     await tick();
     assert.strictEqual(f.engine.publicJob(job).closing, true);
@@ -872,7 +983,10 @@ module.exports = async function runCancelEngineTests({ checkAsync }) {
 
   await checkAsync("取消任务：AdsPower 关闭失败保留环境所有权，成功重试才释放", async () => {
     let fail = false;
-    const f = engineFixture({ adsStop: async () => fail ? { ok: false, error: "fixture AdsPower stop failed" } : { ok: true } });
+    const f = engineFixture({
+      adsStop: async () => fail ? { ok: false, error: "fixture AdsPower stop failed" } : { ok: true },
+      adsStatus: () => ({ code: 0, data: { status: fail ? "Active" : "Inactive" } }),
+    });
     const options = { mode: "adspower", envSerials: ["fixture-ads-retry"], keepOpen: true };
     const job = f.create(options);
     await until(() => job.status === "done", "AdsPower 保留窗口");
@@ -893,10 +1007,28 @@ module.exports = async function runCancelEngineTests({ checkAsync }) {
     assert.strictEqual(f.calls.localStops, 0);
   });
 
+  await checkAsync("取消任务：AdsPower 窗口已自行关闭时状态确认可释放环境", async () => {
+    let alreadyInactive = false;
+    const f = engineFixture({ adsStop: () => alreadyInactive
+      ? { code: -1, msg: "fixture already inactive" } : { code: 0 } });
+    const options = { mode: "adspower", envSerials: ["fixture-ads-manually-closed"], keepOpen: true };
+    const job = f.create(options);
+    await until(() => job.status === "done", "窗口保留");
+    alreadyInactive = true;
+    await f.engine.cancelJob(job.id);
+    await cancelSettled(f, job);
+    assert.strictEqual(job.envs[0].retained, false);
+    assert.strictEqual(f.engine.publicJob(job).closeErrors.length, 0);
+    const next = f.create({ ...options, accountIds: ["second"], keepOpen: false });
+    await until(() => next.status === "done", "已关闭环境可安全复用");
+  });
+
   await checkAsync("取消任务：AdsPower 原始 code 非零响应不能被当成关闭成功", async () => {
     let fail = false;
-    const f = engineFixture({ adsStop: async () => fail
-      ? { code: 1, msg: "fixture API refused to stop" } : { code: 0, msg: "success" } });
+    const f = engineFixture({
+      adsStop: async () => fail ? { code: 1, msg: "fixture API refused to stop" } : { code: 0, msg: "success" },
+      adsStatus: () => ({ code: 0, data: { status: fail ? "Active" : "Inactive" } }),
+    });
     const job = f.create({ mode: "adspower", envSerials: ["fixture-ads-raw-error"], keepOpen: true });
     await until(() => job.status === "done", "AdsPower 窗口已保留");
     fail = true;
@@ -914,7 +1046,10 @@ module.exports = async function runCancelEngineTests({ checkAsync }) {
   await checkAsync("取消任务：AdsPower 空响应或缺少成功字段不能误报已关闭", async () => {
     for (const response of [null, {}, { error: "fixture response has no success flag" }]) {
       let fail = false;
-      const f = engineFixture({ adsStop: async () => fail ? response : { code: 0 } });
+      const f = engineFixture({
+        adsStop: async () => fail ? response : { code: 0 },
+        adsStatus: () => ({ code: 0, data: { status: fail ? "Active" : "Inactive" } }),
+      });
       const options = { mode: "adspower", envSerials: ["fixture-ads-unconfirmed-stop"], keepOpen: true };
       const job = f.create(options);
       await until(() => job.status === "done", "AdsPower 窗口已保留");
@@ -933,10 +1068,15 @@ module.exports = async function runCancelEngineTests({ checkAsync }) {
   await checkAsync("取消任务：AdsPower 关闭外层超时后重试成功也须等旧请求结束再释放环境", async () => {
     const oldStop = deferred();
     let delayNextStop = false;
-    const f = engineFixture({ adsStop: async () => {
-      if (delayNextStop) { delayNextStop = false; return oldStop.promise; }
-      return { code: 0 };
-    } });
+    let awaitingClose = false;
+    const f = engineFixture({
+      adsStop: async () => {
+        if (delayNextStop) { delayNextStop = false; awaitingClose = true; return oldStop.promise; }
+        awaitingClose = false;
+        return { code: 0 };
+      },
+      adsStatus: () => ({ code: 0, data: { status: awaitingClose ? "Active" : "Inactive" } }),
+    });
     const options = { mode: "adspower", envSerials: ["fixture-ads-stop-timeout"], keepOpen: true };
     const job = f.create(options);
     await until(() => job.status === "done", "AdsPower 窗口已保留");

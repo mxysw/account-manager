@@ -1014,6 +1014,13 @@ check("设备通知页即使含“确认本人/发送/重新发送”也不能�
   }), false, "只有重新发送而没有明确验证码语义时不能按短信页终止");
 });
 
+check("登录人机识别不受 URL 查询参数或泛化背景字样污染", () => {
+  const { riskReason } = login.helpers;
+  const passwordUrl = "https://accounts.google.com/v3/signin/challenge/pwd?continue=https%3A%2F%2Fexample.com%2Frecaptcha%2Fhelp";
+  assert.strictEqual(riskReason("Welcome Enter your password", passwordUrl), "");
+  assert.strictEqual(riskReason("Help: captcha settings", "https://accounts.google.com/v3/signin/challenge/pwd"), "");
+});
+
 // Google 安全代码(g.co/sc / challenge/ootp)与身份验证器 TOTP 都有 6 位输入框，必须先按页面语义分类，
 // 不能再用 input[type=tel] 或泛化的“输入验证码”直接判为 TOTP。
 check("两步验证·g.co/sc 安全代码页不是身份验证器 TOTP", () => {
@@ -2204,8 +2211,82 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
 });
 
 (async () => {
+  await checkAsync("无 solver 时明确可见人机提示需稳定确认且只读", async () => {
+    const url = "https://accounts.google.com/v3/signin/challenge/recaptcha";
+    let reads = 0;
+    let waits = 0;
+    const result = await login.helpers.observeCaptchaWithoutSolver({ url: () => url }, url, {
+      bodyText: async () => { reads += 1; return "请完成 reCAPTCHA，证明您不是自动程序"; },
+      sleep: async () => { waits += 1; },
+    });
+    assert.strictEqual(result, "confirmed");
+    assert.strictEqual(reads, 2);
+    assert.strictEqual(waits, 1);
+    assert.match(login.helpers.riskReason("请完成 reCAPTCHA，证明您不是自动程序", url), /人机验证/);
+
+    let current = url;
+    const moved = await login.helpers.observeCaptchaWithoutSolver({ url: () => current }, url, {
+      bodyText: async () => "",
+      sleep: async () => { current = "https://accounts.google.com/v3/signin/challenge/pwd"; },
+    });
+    assert.strictEqual(moved, "moved", "过渡页转到密码页后应继续观察，不保留旧人机结论");
+  });
+
+  await checkAsync("完整登录密码页慢响应只提交一次，导航后继续", async () => {
+    let url = "https://accounts.google.com/v3/signin/challenge/pwd";
+    let now = 0;
+    let clicks = 0;
+    const result = await login.helpers.submitLoginPasswordOnce({ url: () => url }, url, ["input[type='password']"], "fixture-password", {
+      ensureValue: async () => true,
+      submitOnce: async () => { clicks += 1; return { attempted: true, confirmed: true }; },
+      bodyText: async () => "Welcome Enter your password",
+      sleep: async (ms) => { now += ms; if (now >= 3000) url = "https://accounts.google.com/v3/signin/challenge/totp"; },
+      now: () => now,
+      totalMs: 5000,
+      pollMs: 300,
+    });
+    assert.strictEqual(result.kind, "moved");
+    assert.strictEqual(clicks, 1, "慢响应期间不得重新点击密码下一步");
+  });
+
+  await checkAsync("完整登录密码页明确错误时只提交一次并停止", async () => {
+    const url = "https://accounts.google.com/v3/signin/challenge/pwd";
+    let now = 0;
+    let clicks = 0;
+    const result = await login.helpers.submitLoginPasswordOnce({ url: () => url }, url, ["input[type='password']"], "fixture-password", {
+      ensureValue: async () => true,
+      submitOnce: async () => { clicks += 1; return { attempted: true, confirmed: true }; },
+      bodyText: async () => now >= 900 ? "Wrong password" : "Welcome Enter your password",
+      sleep: async (ms) => { now += ms; },
+      now: () => now,
+      totalMs: 5000,
+      pollMs: 300,
+    });
+    assert.strictEqual(result.kind, "password_invalid");
+    assert.strictEqual(result.problem.reason, "wrong");
+    assert.strictEqual(clicks, 1, "错误文案出现前后都不得再次提交密码");
+  });
+
+  await checkAsync("完整登录密码页无明确反馈时停止，仍只提交一次", async () => {
+    const url = "https://accounts.google.com/v3/signin/challenge/pwd";
+    let now = 0;
+    let clicks = 0;
+    const result = await login.helpers.submitLoginPasswordOnce({ url: () => url }, url, ["input[type='password']"], "fixture-password", {
+      ensureValue: async () => true,
+      submitOnce: async () => { clicks += 1; return { attempted: true, confirmed: true }; },
+      bodyText: async () => "Welcome Enter your password",
+      sleep: async (ms) => { now += ms; },
+      now: () => now,
+      totalMs: 1500,
+      pollMs: 300,
+    });
+    assert.strictEqual(result.kind, "timeout");
+    assert.strictEqual(clicks, 1, "同一路径无反馈不得再次提交密码");
+  });
+
   await checkAsync("完整登录支持纯账号密码，不要求辅助邮箱或 2FA", async () => {
     let phase = "email";
+    let passwordClicks = 0;
     const values = { email: "", password: "" };
     const events = [];
     const urlByPhase = {
@@ -2232,6 +2313,11 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
     const page = {
       url: () => urlByPhase[phase],
       $: async (selector) => {
+        if (phase === "password" && selector === "#passwordNext button") return {
+          evaluate: async () => true,
+          click: async () => { passwordClicks += 1; if (values.password === "fixture-password") phase = "done"; },
+          dispose: async () => {},
+        };
         if (phase === "email" && selectors.email.has(selector)) return makeInput("email");
         if (phase === "password" && selectors.password.has(selector)) return makeInput("password");
         return null;
@@ -2264,6 +2350,7 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
     assert.strictEqual(phase, "done", "应依次提交邮箱和密码后进入账号页");
     assert.strictEqual(values.email, "password-only@example.com");
     assert.strictEqual(values.password, "fixture-password");
+    assert.strictEqual(passwordClicks, 1, "完整登录应只点击一次密码下一步");
     assert.ok(!events.includes("handling_totp"), "无 TOTP 的账号不应进入验证器填写分支");
   });
 
@@ -2287,6 +2374,11 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
   await require("./cancel-ui")({ checkAsync });
   await require("./capsolver")({ check, checkAsync });
   await require("./capsolver-settings")({ check, checkAsync });
+  await require("./adspower-settings")({ check, checkAsync });
+  await require("./adspower-ui")({ check, checkAsync });
+  await require("./adspower-v2")({ checkAsync });
+  await require("./adspower-temp-ledger")({ checkAsync });
+  await require("./adspower-temp-engine")({ checkAsync });
   await require("./recaptcha")({ check, checkAsync });
   await require("./recaptcha-observer")({ check, checkAsync });
   await require("./login-captcha")({ checkAsync });

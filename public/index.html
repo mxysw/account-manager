@@ -172,7 +172,7 @@
         </section>
       </div>
 
-      <!-- ============ 批量操作：本机临时浏览器优先，AdsPower 作为兼容模式保留 ============ -->
+      <!-- ============ 批量操作：本机临时浏览器与 AdsPower 模式 ============ -->
       <!-- 运行针对全局 selected 集合，所以在任何视图勾选账号后都能「对选中账号运行」。 -->
       <section class="panel collapsible shared-auto">
         <div class="panel-head">
@@ -183,13 +183,27 @@
           <div class="batch-toolbar">
             <div class="switch-row mode-row">
               <label class="switch"><input type="radio" name="runMode" value="local" checked /> 本机临时浏览器</label>
-              <label class="switch"><input type="radio" name="runMode" value="adspower" /> AdsPower（兼容）</label>
+              <label class="switch"><input type="radio" name="runMode" value="adspower" /> AdsPower（复用现有环境）</label>
+              <label class="switch"><input type="radio" name="runMode" value="adspower_temp" /> AdsPower 临时环境</label>
             </div>
             <div class="auto-grid">
-              <label class="field" id="apiKeyField">
-                <span>AdsPower API Key</span>
-                <input id="apiKey" type="password" autocomplete="off" placeholder="保存在本浏览器" />
-              </label>
+              <div class="field" id="apiKeyField" hidden>
+                <span>AdsPower 本机连接</span>
+                <label for="adspowerAddress">本地 API 地址</label>
+                <input id="adspowerAddress" type="text" value="127.0.0.1" autocomplete="off" spellcheck="false" aria-describedby="adspowerAddressHint" />
+                <span id="adspowerAddressHint">仅连接本机：127.0.0.1、localhost 或 local.adspower.net；地址不含端口。</span>
+                <label for="adspowerPort">本地 API 端口</label>
+                <input id="adspowerPort" type="number" min="1" max="65535" step="1" value="50325" />
+                <label for="apiKey">API Key（留空则保留已保存的密钥）</label>
+                <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="输入后保存到本机" />
+                <div class="capsolver-key-actions">
+                  <button id="adspowerSaveBtn" type="button" class="ghost slim">保存连接</button>
+                  <button id="adspowerTestBtn" type="button" class="ghost slim" disabled>测试连接</button>
+                  <button id="adspowerClearBtn" type="button" class="ghost slim">清除配置</button>
+                  <span id="adspowerKeyStatus" class="capsolver-key-status" role="status" aria-live="polite">读取配置中…</span>
+                </div>
+                <span id="adspowerTestStatus" role="status" aria-live="polite">先保存连接后再测试</span>
+              </div>
               <label class="field concurrency-field">
                 <span id="maxConcurrentLabel">并发数</span>
                 <input id="maxConcurrent" type="number" min="1" max="20" value="3" />
@@ -197,7 +211,7 @@
             </div>
             <div class="switch-row batch-flags">
               <label class="switch" id="optRandomFp"><input id="randomFp" type="checkbox" checked /> 随机指纹</label>
-              <label class="switch"><input id="clearData" type="checkbox" checked /> 运行前后清空数据</label>
+              <label class="switch" id="optClearData"><input id="clearData" type="checkbox" checked /> 运行前后清空数据</label>
               <label class="switch" id="optProxy"><input id="useProxy" type="checkbox" /> 动态住宅代理</label>
               <label class="switch" id="optLocalProxy" hidden><input type="checkbox" disabled /> 代理（规划中）</label>
               <label class="switch"><input id="keepOpen" type="checkbox" /> 普通跑完保留</label>
@@ -257,6 +271,9 @@
           </div>
           <div class="field" id="localHint" hidden>
             <p class="proxy-hint muted">本机临时浏览器模式：无需选择 AdsPower 窗口。按上面「最大并发」自动开 N 个一次性 Chrome/Edge，跑完（或停止）即关闭并清理临时数据。代理仍在规划中（见上方占位）。</p>
+          </div>
+          <div class="field" id="adspowerTempHint" hidden>
+            <p class="proxy-hint muted">AdsPower 临时环境：无需选择已有窗口，按「最大并发」创建空白临时环境。普通跑完默认不保留；窗口成功关闭后才移入 AdsPower 回收站，关闭失败不删除。如需立即彻底删除，回收站需你手动永久清空；AdsPower 官方说明其中的环境会在 30 天后自动永久删除。若选择保留窗口，先保留现场；之后点「停止并关闭窗口」并成功关闭后移入回收站。不启用随机指纹或代理轮换。</p>
           </div>
           <div class="field action-field">
             <span>选择操作（建议先选“登录账号”）</span>

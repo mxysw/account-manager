@@ -612,15 +612,19 @@ async function clickNext(page) {
   ]);
 }
 
+const CAPTCHA_RISK = "出现验证码 / 人机验证，需人工处理";
+const CAPTCHA_PATH_RE = /\/challenge\/(?:recaptcha|captcha)(?:\/|$)/i;
+const CAPTCHA_PROMPT_RE = /人机验证|人機驗證|证明您不是自动程序|驗證您不是機器人|验证您不是机器人|(?:prove|verify|confirm|show).{0,30}(?:human|not a robot|not an automated program)|(?:complete|solve|verify).{0,24}\b(?:re)?captcha\b|\b(?:re)?captcha\b.{0,24}(?:verification|challenge|验证|驗證)/i;
+
 function riskReason(text, url) {
   const path = parseLoc(url).path;
-  const hay = `${text}\n${url}`;
+  // Login query parameters can contain unrelated destination URLs and stale
+  // challenge names. Only the active path and visible body text are signals.
+  const hay = `${text}\n${path}`;
   if (/This browser or app may not be secure|Try using a different browser|此浏览器或应用可能不安全|请尝试使用其他浏览器/i.test(hay)) {
     return "Google 判定该浏览器环境不安全（自动化被拦）";
   }
-  if (/captcha|recaptcha|证明您不是自动程序|验证您不是机器人/i.test(hay)) {
-    return "出现验证码 / 人机验证，需人工处理";
-  }
+  if (CAPTCHA_PATH_RE.test(path) || CAPTCHA_PROMPT_RE.test(String(text || ""))) return CAPTCHA_RISK;
   // 所有 /challenge/... 页面都交给下方专门状态机：dp/selection/totp/ipp 有明确处理，
   // Google 新增的未知 challenge 也会有限等待 hydration 后返回“未知验证页”。否则 SPA 壳上的
   // “Verify it's you / 验证身份”会在真实验证方式出现前被误判成笼统风控。
@@ -631,6 +635,27 @@ function riskReason(text, url) {
     return `Google 要求额外身份验证（可疑登录，页面：${path || "未知"}）`;
   }
   return "";
+}
+
+// Without a solver, do not infer a CAPTCHA from a route or stale page copy on
+// the first read. This observation only reads URL and visible body text; it
+// never clicks a checkbox or a challenge control.
+async function observeCaptchaWithoutSolver(page, initialUrl, opts = {}) {
+  const readBody = opts.bodyText || bodyText;
+  const wait = opts.sleep || sleep;
+  const initial = parseLoc(initialUrl);
+  let stablePrompts = 0;
+  for (let poll = 0; poll < 6; poll += 1) {
+    checkCancelled(opts.signal);
+    const location = parseLoc(page.url());
+    if (location.host !== initial.host || location.path !== initial.path) return "moved";
+    const text = await readBody(page);
+    stablePrompts = CAPTCHA_PATH_RE.test(location.path) && CAPTCHA_PROMPT_RE.test(text)
+      ? stablePrompts + 1 : 0;
+    if (stablePrompts >= 2) return "confirmed";
+    if (poll < 5) await wait(500);
+  }
+  return "unconfirmed";
 }
 
 /**
@@ -839,7 +864,7 @@ function isPasswordAcceptedDestination(url) {
   return /\/speedbump(?:\/|$)/i.test(path);
 }
 
-// 密码检测专用的一次性提交。只选择 passwordNext，并且一旦发起 click（哪怕随后因导航导致
+// 密码步骤共用的一次性提交。只选择 passwordNext，并且一旦发起 click（哪怕随后因导航导致
 // execution context/detached 异常）就视为“已经尝试提交”，后续只读观察，绝不再 clickText/按 Enter。
 // 只有页面根本没有 passwordNext 时，才以密码框 Enter 作为唯一一次提交方式。
 async function submitPasswordOnce(page, selectors, opts = {}) {
@@ -870,6 +895,57 @@ async function submitPasswordOnce(page, selectors, opts = {}) {
     await input.dispose().catch(() => {});
   }
   return { attempted: true, confirmed };
+}
+
+// Full login must also submit the password only once. A slow response or an
+// error rendered on the same URL is not permission to click Next again.
+// Dependency overrides keep the observation loop deterministic in tests.
+async function submitLoginPasswordOnce(page, beforeUrl, selectors, value, opts = {}) {
+  const ensure = opts.ensureValue || ensureValue;
+  const submit = opts.submitOnce || submitPasswordOnce;
+  const readBody = opts.bodyText || bodyText;
+  const pause = opts.sleep || sleep;
+  const now = opts.now || Date.now;
+  const totalMs = Number.isFinite(opts.totalMs) ? opts.totalMs : 15000;
+  const pollMs = Number.isFinite(opts.pollMs) ? opts.pollMs : 300;
+  const before = parseLoc(beforeUrl);
+
+  let ready = false;
+  for (let check = 0; check < 7; check += 1) {
+    checkCancelled(opts.signal);
+    ready = await ensure(page, selectors, value, { force: true });
+    if (ready) break;
+    if (check < 6) await pause(250);
+  }
+  if (!ready) return { kind: "not_ready" };
+
+  // A rejected click promise can mean navigation detached the button after
+  // dispatch. Observe the page; never attempt a second physical submission.
+  checkCancelled(opts.signal);
+  let submission;
+  try { submission = await submit(page, selectors); }
+  catch (_) { submission = { attempted: true, confirmed: false }; }
+  if (!submission?.attempted) return { kind: "not_submitted" };
+  opts.onAttempt?.();
+
+  const deadline = now() + totalMs;
+  do {
+    checkCancelled(opts.signal);
+    await pause(pollMs);
+    checkCancelled(opts.signal);
+    const url = page.url();
+    const location = parseLoc(url);
+    if (location.host !== before.host || location.path !== before.path) return { kind: "moved" };
+    const text = await readBody(page);
+    const problem = classifyPasswordProblem(text);
+    if (problem.failed) return { kind: "password_invalid", problem };
+    if (riskReason(text, url) || hasGoogleRejectionText(text, url)
+      || /\/disabled\b|deniedsigninrejected|\/signin\/rejected/i.test(location.path)) {
+      return { kind: "state_changed" };
+    }
+  } while (now() < deadline);
+
+  return { kind: "timeout" };
 }
 
 // 打开登录页的冷启动重试由完整登录与“仅检测密码”共用。返回的新 page 可能替换掉清数据后
@@ -965,6 +1041,14 @@ async function submitPasswordCheck(page, beforeUrl, selectors, value, opts = {})
 
     // 人机/浏览器拦截不能证明密码对错，必须报告“无法确认”，不能误标密码正确。
     const risk = riskReason(text, url);
+    if (risk === CAPTCHA_RISK) {
+      const observed = await observeCaptchaWithoutSolver(page, url, { bodyText: readBody, sleep: pause });
+      if (observed === "moved") continue;
+      if (observed !== "confirmed") {
+        return { outcome: "need_verify", reasonCode: "unknown_challenge",
+          detail: { [label]: "页面出现验证线索，但未确认当前为人机验证；无法确认密码是否正确" } };
+      }
+    }
     if (risk) {
       return { outcome: "need_verify", detail: { [label]: `${risk}；无法确认密码是否正确` } };
     }
@@ -1065,6 +1149,7 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
   let speedbumpStuck = 0;
   let emailFillTries = 0;
   let passwordFillTries = 0;
+  let passwordSubmitAttempted = false;
   let totpErrorTries = 0;
   let totpWrongTries = 0;
   // 设备通知页 →「试试其他方式」→ 选「身份验证器」这条切换链路的尝试次数，超过即判需人工，防止在
@@ -1132,6 +1217,14 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
           outcome: "need_verify", reasonCode,
           detail: { [label]: `${captchaAccepted ? "人机验证通过后，Google 仍要求" : "Google 要求"}${requirement}；未填写号码、未发送短信，已停止后续操作` },
         };
+      }
+    }
+    if (risk === CAPTCHA_RISK && !opts.captchaSolver) {
+      const observed = await observeCaptchaWithoutSolver(page, url, { signal: opts.signal });
+      if (observed === "moved") continue;
+      if (observed !== "confirmed") {
+        return { outcome: "need_verify", reasonCode: "unknown_challenge",
+          detail: { [label]: "页面出现验证线索，但未确认当前为人机验证；已停止自动操作" } };
       }
     }
     if (risk) return { outcome: "need_verify", detail: { [label]: risk } };
@@ -1463,6 +1556,10 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
 
     // 密码：有可见密码框、且不在 TOTP 验证页 / 选择验证方式页（这些页可能残留隐藏密码框）才当作密码步骤。
     if (passwordVisible && !onTotpPage && !/\/challenge\/selection/i.test(url)) {
+      if (passwordSubmitAttempted) {
+        return { outcome: "need_verify", reasonCode: "timeout",
+          detail: { [label]: "密码已尝试提交一次，但页面再次显示密码步骤；已停止且没有重复提交" } };
+      }
       emit("filling_password", {});
       passwordFillTries += 1;
       if (passwordFillTries > 4) {
@@ -1479,9 +1576,34 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
           pollMs: opts.passwordCheckPollMs,
         });
       }
-      await submitStep(page, beforeUrl, passwordSel, account.password, 15000, () => {
-        if (flowMeta) flowMeta.passwordSubmitted = true;
+      const passwordSubmission = await submitLoginPasswordOnce(page, beforeUrl, passwordSel, account.password, {
+        onAttempt: () => {
+          passwordSubmitAttempted = true;
+          if (flowMeta) flowMeta.passwordSubmitted = true;
+        },
+        signal: opts.signal,
       });
+      if (passwordSubmission.kind === "password_invalid") {
+        const prob = passwordSubmission.problem;
+        emit("password_invalid", { reason: prob.reason, days: prob.days || "" });
+        const detailMsg = prob.reason === "changed"
+          ? `密码已被更改${prob.days ? `（提示：${prob.days} 天前更改）` : ""}，账号库密码已失效，需更新密码`
+          : "密码错误：账号库密码与 Google 现有密码不一致，账号库密码已失效，需更新密码";
+        return {
+          outcome: "error",
+          reasonCode: prob.reason === "changed" ? "password_changed" : "password_wrong",
+          daysAgo: prob.reason === "changed" && prob.days != null ? Number(prob.days) : undefined,
+          detail: { [label]: detailMsg },
+        };
+      }
+      if (passwordSubmission.kind === "not_ready" || passwordSubmission.kind === "not_submitted") {
+        return { outcome: "error", reasonCode: "other",
+          detail: { [label]: "密码未能可靠提交，已停止且没有重复点击" } };
+      }
+      if (passwordSubmission.kind === "timeout") {
+        return { outcome: "need_verify", reasonCode: "timeout",
+          detail: { [label]: "密码只尝试提交一次，但页面未给出明确结果；已停止且没有重复点击" } };
+      }
       continue;
     }
 
@@ -1583,7 +1705,7 @@ module.exports.helpers = {
   DEVICE_PROMPT_RE, TRY_ANOTHER_RE, AUTH_OPTION_RE, SECURITY_CODE_RE,
   isSecurityCodeChallenge, isAuthenticatorTotpContext, shouldFillTotp, isDevicePromptChallenge,
   waitForAuthMethodList, openAlternativeMethods, waitForAuthenticatorTotp, chooseAuthenticatorMethod,
-  riskReason, isAccountChooserContext, driveAuthFlow, openLoginPage, submitPasswordOnce, submitPasswordCheck, tagPasswordCheck, isPasswordAcceptedDestination,
+  riskReason, observeCaptchaWithoutSolver, isAccountChooserContext, driveAuthFlow, openLoginPage, submitPasswordOnce, submitLoginPasswordOnce, submitPasswordCheck, tagPasswordCheck, isPasswordAcceptedDestination,
   classifyRecoveryEmail, submitRecoveryEmail, hasRecoveryEmailOption, chooseRecoveryEmailMethod, clickRecoveryEmailNext,
   IPP_CONSENT_RE, VERIFY_SENDCODE_RE, isSmsConsentTextFallback,
   classifyPasswordProblem, extractPwdChangeDays, PWD_CHANGED_RE, WRONG_PWD_RE,

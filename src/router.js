@@ -11,10 +11,17 @@ const { AdsPower } = require("./automation/adspower");
 const adsCli = require("./automation/ads-cli");
 const timeSync = require("./automation/time-sync");
 const capsolverSettings = require("./capsolver-settings");
+const adspowerSettings = require("./adspower-settings");
 
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
 
 function sameOriginSettingsRequest(req) {
+  // Check Host before comparing Origin. A matching attacker-controlled
+  // Host/Origin pair must not reach local settings or automation endpoints.
+  const host = req.headers.host;
+  const match = typeof host === "string"
+    ? /^(?:127\.0\.0\.1|localhost|\[::1\])(?::([1-9][0-9]{0,4}))?$/i.exec(host) : null;
+  if (!match || (match[1] && Number(match[1]) > 65535)) return false;
   if (req.headers["sec-fetch-site"] === "cross-site") return false;
   const origin = req.headers.origin;
   if (!origin) return true; // 本机 CLI 与同源测试不一定带 Origin。
@@ -463,27 +470,51 @@ const ROUTES = [
     try { return { status: 200, body: capsolverSettings.clear() }; }
     catch (_) { return { status: 500, body: { error: "CAPSOLVER 配置清除失败" } }; }
   }],
+  ["GET", /^\/api\/settings\/adspower$/, (req) => {
+    if (!sameOriginSettingsRequest(req)) return { status: 403, body: { error: "仅允许本机同源配置请求" } };
+    try { return { status: 200, body: adspowerSettings.status() }; }
+    catch (_) { return { status: 500, body: { error: "AdsPower 配置读取失败，请重新保存" } }; }
+  }],
+  ["PUT", /^\/api\/settings\/adspower$/, async (req) => {
+    if (!sameOriginSettingsRequest(req)) return { status: 403, body: { error: "仅允许本机同源配置请求" } };
+    if (!/^application\/json(?:\s*;|$)/i.test(req.headers["content-type"] || "")) return { status: 415, body: { error: "请使用 JSON 保存配置" } };
+    try { return { status: 200, body: adspowerSettings.save(await readBody(req)) }; }
+    catch (_) { return { status: 400, body: { error: "AdsPower 配置保存失败，请检查端口、密钥和本机权限" } }; }
+  }],
+  ["DELETE", /^\/api\/settings\/adspower$/, (req) => {
+    if (!sameOriginSettingsRequest(req)) return { status: 403, body: { error: "仅允许本机同源配置请求" } };
+    try { return { status: 200, body: adspowerSettings.clear() }; }
+    catch (_) { return { status: 500, body: { error: "AdsPower 配置清除失败" } }; }
+  }],
+  ["POST", /^\/api\/settings\/adspower\/test$/, async (req) => {
+    if (!sameOriginSettingsRequest(req)) return { status: 403, body: { error: "仅允许本机同源配置请求" } };
+    try {
+      const ads = new AdsPower({ apiKey: adspowerSettings.getKey() });
+      if (await ads.checkConnection()) return { status: 200, body: { ok: true } };
+    } catch (_) { /* Never return raw client/API errors or the Bearer key. */ }
+    return { status: 502, body: { error: "AdsPower 本地 API 无法连接，请检查地址、端口、客户端和 API 密钥" } };
+  }],
   ["GET", /^\/api\/automation\/actions$/, () => ({ status: 200, body: { actions: engine.listActions() } })],
 
-  ["GET", /^\/api\/automation\/envs$/, async (req, m, url) => {
-    const apiKey = String(url.searchParams.get("apiKey") || "").trim();
-    const ads = new AdsPower({ apiKey });
+  ["GET", /^\/api\/automation\/envs$/, async (req) => {
+    if (!sameOriginSettingsRequest(req)) return { status: 403, body: { error: "仅允许本机同源请求" } };
     try {
+      const ads = new AdsPower({ apiKey: adspowerSettings.getKey() });
       const [profiles, active] = await Promise.all([ads.listProfiles(), ads.activeUserIds()]);
       const envs = profiles.map((p) => ({ ...p, open: active.has(String(p.userId)) }));
       return { status: 200, body: { envs, total: envs.length } };
-    } catch (err) {
-      return { status: 502, body: { error: `连接 AdsPower 失败：${err.message}（确认 AdsPower 已开启，本地 API 端口 50325 可用）` } };
+    } catch (_) {
+      return { status: 502, body: { error: "连接 AdsPower 失败：请确认已保存 API Key、客户端已开启，并检查设置中的本地 API 端口" } };
     }
   }],
 
-  ["GET", /^\/api\/automation\/proxy-tags$/, async (req, m, url) => {
-    const apiKey = String(url.searchParams.get("apiKey") || "").trim();
+  ["GET", /^\/api\/automation\/proxy-tags$/, async (req) => {
+    if (!sameOriginSettingsRequest(req)) return { status: 403, body: { error: "仅允许本机同源请求" } };
     try {
-      const r = await adsCli.listProxyTags(apiKey);
+      const r = await adsCli.listProxyTags(adspowerSettings.getKey());
       return { status: 200, body: r };
-    } catch (err) {
-      return { status: 502, body: { error: `读取代理标签失败：${err.message}（需 AdsPower 已登录该 API Key 的账号）` } };
+    } catch (_) {
+      return { status: 502, body: { error: "读取代理标签失败：请确认已保存 API Key，AdsPower 已登录对应账号" } };
     }
   }],
 
@@ -501,35 +532,45 @@ const ROUTES = [
       // 第三种策略本身就是启用指令，不要求额外勾选独立 CAPSOLVER 开关。
       captchaOptions = { ...(captchaOptions || {}), enabled: true };
     }
-    const apiKey = String(body.apiKey || "").trim();
-    const mode = body.mode === "local" ? "local" : "adspower";
+    const mode = body.mode === "local" || body.mode === "adspower" || body.mode === "adspower_temp"
+      ? body.mode : "adspower";
+    if (mode !== "local" && !sameOriginSettingsRequest(req)) return { status: 403, body: { error: "仅允许本机同源请求" } };
+    let apiKey = "";
+    let adsBase = null;
+    if (mode !== "local") {
+      // Capture key and address before any asynchronous proxy lookup. A settings
+      // change must not pair this request's old key with a newly saved port.
+      try { apiKey = adspowerSettings.getKey(); adsBase = adspowerSettings.getBase(); }
+      catch (_) { return { status: 400, body: { error: "请先在 AdsPower 设置中保存 API Key" } }; }
+    }
     const envSerials = Array.isArray(body.envs) ? body.envs : String(body.envs || "").split(/[\s,，;；]+/).filter(Boolean);
     const accountIds = Array.isArray(body.accountIds) ? body.accountIds : [];
     const actionIds = engine.normalizeActionSelection(Array.isArray(body.actionIds) ? body.actionIds : []);
     // 本机临时浏览器模式不需要 AdsPower 环境编号，按并发数自动开 N 个本地窗口。
-    if (mode !== "local" && !envSerials.length) return { status: 400, body: { error: "请提供至少一个 AdsPower 环境编号" } };
+    if (mode === "adspower" && !envSerials.length) return { status: 400, body: { error: "请提供至少一个 AdsPower 环境编号" } };
+    if (mode === "adspower_temp" && envSerials.length) return { status: 400, body: { error: "临时环境模式不能指定既有 AdsPower 环境" } };
     if (!accountIds.length) return { status: 400, body: { error: "请选择至少一个账号" } };
     if (!actionIds.length) return { status: 400, body: { error: "请选择至少一个操作" } };
     const actionError = engine.validateActionSelection(actionIds);
     if (actionError) return { status: 400, body: { error: actionError } };
 
     // 代理：AdsPower 模式才用代理池 + 标签；本机模式的代理仍在规划中，透传 proxy.server 即可（UI 暂未对接）。
-    const proxy = body.proxy || null;
-    if (mode !== "local" && proxy && proxy.enabled && proxy.tagId) {
+    const proxy = mode === "adspower_temp" ? null : body.proxy || null;
+    if (mode === "adspower" && proxy && proxy.enabled && proxy.tagId) {
       try {
-        proxy.proxyIds = await adsCli.proxyIdsByTag(apiKey, proxy.tagId);
+        proxy.proxyIds = await adsCli.proxyIdsByTag(apiKey, proxy.tagId, adsBase);
         if (!proxy.proxyIds.length) {
           return { status: 400, body: { error: "该标签下没有代理，请检查标签或往里添加代理" } };
         }
-      } catch (err) {
-        return { status: 502, body: { error: `读取标签代理失败：${err.message}` } };
+      } catch (_) {
+        return { status: 502, body: { error: "读取标签代理失败，请检查 AdsPower 连接设置" } };
       }
     }
 
     let job;
     try {
       job = engine.createJob({
-        apiKey, mode, envSerials, accountIds, actionIds,
+        apiKey, adsBase, mode, envSerials, accountIds, actionIds,
         maxConcurrent: body.maxConcurrent, targets: body.targets,
         randomFp: body.randomFp, clearData: body.clearData, keepOpen: body.keepOpen,
         background: body.background,

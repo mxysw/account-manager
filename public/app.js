@@ -122,7 +122,7 @@ const STATUS_CLASS = {
   removed: "s-ok", none: "s-unknown",
 };
 const LS = {
-  apiKey: "am_apiKey", envs: "am_envs", max: "am_max", proxy: "am_proxy",
+  envs: "am_envs", max: "am_max", proxy: "am_proxy",
   accounts: "am_sel_accounts", actions: "am_sel_actions", flags: "am_flags",
   mode: "am_mode", job: "am_jobId", filterSale: "am_filter_sale",
   closeJob: "am_closeJobId", cancelJob: "am_cancelJobId",
@@ -198,6 +198,8 @@ let jobId = null;
 let jobPolling = false;
 let jobStarting = false;
 let appReady = false;
+// 只有当前 AdsPower 连接的窗口列表已成功刷新，才能使用所选 serial 发起任务。
+let adspowerEnvsReady = false;
 // 运行任务与“最后一个任务的待关闭窗口”分开，保留窗口不阻止新批次，也不遗失关闭入口。
 let closeTargetId = null;
 let trackedJob = null;
@@ -210,7 +212,12 @@ let jobStateEpoch = 0;
 let jobRefreshRunning = false;
 
 function syncRunButton() {
-  el("runBtn").disabled = !appReady || jobStarting || !!jobId || cancelInFlight;
+  const mode = typeof currentMode === "function" ? currentMode() : "local";
+  const waitingForAdsPowerSettings = mode !== "local"
+    && (!adspowerSettingsLoaded || !adspowerConfigured || adspowerSettingsBusy);
+  const waitingForAdsPowerEnvs = mode === "adspower" && !adspowerEnvsReady;
+  el("runBtn").disabled = !appReady || jobStarting || !!jobId || cancelInFlight
+    || waitingForAdsPowerSettings || waitingForAdsPowerEnvs;
   syncStopButton();
 }
 // 运行日志：最近一次渲染过的 job（用于筛选开关切换时本地重渲染，无需等下一轮轮询）。
@@ -1898,13 +1905,190 @@ el("classifyBtn").addEventListener("click", async () => {
 });
 
 // ---- 自动化 ----
-el("apiKey").value = localStorage.getItem(LS.apiKey) || "";
+// 旧版曾把 AdsPower 密钥保存在浏览器本地存储；升级后只保留服务端受保护配置。
+try { localStorage.removeItem("am_apiKey"); } catch (_) { /* Storage may be disabled. */ }
+el("apiKey").value = "";
 el("maxConcurrent").value = localStorage.getItem(LS.max) || "3";
-el("apiKey").addEventListener("input", () => localStorage.setItem(LS.apiKey, el("apiKey").value.trim()));
 el("maxConcurrent").addEventListener("input", () => localStorage.setItem(LS.max, el("maxConcurrent").value));
+
+let adspowerConfigured = false;
+let adspowerSettingsLoaded = false;
+let adspowerSettingsBusy = false;
+let adspowerTestBusy = false;
+let adspowerSettingsRevision = 0;
+let adspowerSavedAddress = "127.0.0.1";
+let adspowerSavedPort = 50325;
+function normalizeAdspowerAddress(value) {
+  const address = String(value || "").trim().toLowerCase().replace(/^http:\/\//, "");
+  return ["127.0.0.1", "localhost", "local.adspower.net"].includes(address) ? "127.0.0.1" : null;
+}
+function adspowerHasUnsavedChanges() {
+  return normalizeAdspowerAddress(el("adspowerAddress").value) !== adspowerSavedAddress
+    || Number(el("adspowerPort").value) !== adspowerSavedPort
+    || !!el("apiKey").value.trim();
+}
+function syncAdspowerSettingsButtons() {
+  const busy = adspowerSettingsBusy || adspowerTestBusy;
+  el("adspowerSaveBtn").disabled = busy;
+  el("adspowerClearBtn").disabled = busy || !adspowerSettingsLoaded || !adspowerConfigured;
+  el("adspowerTestBtn").disabled = busy || !adspowerSettingsLoaded || !adspowerConfigured || adspowerHasUnsavedChanges();
+  el("adspowerAddress").disabled = busy;
+  el("adspowerPort").disabled = busy;
+  el("apiKey").disabled = busy;
+  syncRunButton();
+}
+function updateAdspowerTestPrompt() {
+  if (!adspowerSettingsLoaded || !adspowerConfigured) {
+    el("adspowerTestStatus").textContent = "先保存连接后再测试";
+  } else if (adspowerHasUnsavedChanges()) {
+    el("adspowerTestStatus").textContent = "设置已修改，请先保存后测试";
+  } else {
+    el("adspowerTestStatus").textContent = "已保存，点击“测试连接”检查 AdsPower 是否可用";
+  }
+}
+async function loadAdspowerSettings() {
+  const revision = ++adspowerSettingsRevision;
+  el("adspowerKeyStatus").textContent = "读取配置中…";
+  try {
+    const data = await api("/api/settings/adspower");
+    if (revision !== adspowerSettingsRevision) return;
+    if (typeof data.configured !== "boolean" || !Number.isInteger(data.port)
+        || !normalizeAdspowerAddress(data.address)) throw new Error("invalid settings response");
+    adspowerConfigured = data.configured;
+    adspowerSettingsLoaded = true;
+    adspowerSavedAddress = normalizeAdspowerAddress(data.address);
+    adspowerSavedPort = data.port;
+    el("adspowerAddress").value = adspowerSavedAddress;
+    el("adspowerPort").value = String(data.port);
+    el("apiKey").value = "";
+    el("adspowerKeyStatus").textContent = data.configured ? "密钥已保存到本机" : "未保存密钥";
+    resetAdspowerEnvironments();
+    updateAdspowerTestPrompt();
+  } catch (_) {
+    if (revision !== adspowerSettingsRevision) return;
+    adspowerConfigured = false;
+    adspowerSettingsLoaded = false;
+    el("adspowerKeyStatus").textContent = "读取配置失败，请重试";
+    updateAdspowerTestPrompt();
+  } finally {
+    if (revision === adspowerSettingsRevision) syncAdspowerSettingsButtons();
+  }
+}
+async function saveAdspowerSettings() {
+  if (adspowerSettingsBusy || adspowerTestBusy) return;
+  const address = normalizeAdspowerAddress(el("adspowerAddress").value);
+  if (!address) {
+    el("adspowerKeyStatus").textContent = "地址只能是本机 127.0.0.1、localhost 或 local.adspower.net（不含端口）";
+    return;
+  }
+  const port = Number(el("adspowerPort").value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    el("adspowerKeyStatus").textContent = "端口须为 1–65535 的整数";
+    return;
+  }
+  const apiKey = el("apiKey").value.trim();
+  if (!adspowerConfigured && !apiKey) {
+    el("adspowerKeyStatus").textContent = "请先输入 AdsPower API Key";
+    return;
+  }
+  adspowerSettingsBusy = true;
+  adspowerSettingsRevision += 1;
+  syncAdspowerSettingsButtons();
+  el("adspowerKeyStatus").textContent = "保存中…";
+  try {
+    const data = await api("/api/settings/adspower", {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ address, port, apiKey }),
+    });
+    if (data.configured !== true || data.port !== port || normalizeAdspowerAddress(data.address) !== address) {
+      throw new Error("invalid settings response");
+    }
+    adspowerConfigured = true;
+    adspowerSettingsLoaded = true;
+    adspowerSavedAddress = address;
+    adspowerSavedPort = port;
+    el("adspowerAddress").value = address;
+    el("apiKey").value = "";
+    el("adspowerKeyStatus").textContent = `连接已保存到本机 · ${address}:${port}`;
+    resetAdspowerEnvironments();
+    updateAdspowerTestPrompt();
+    if (currentMode() === "adspower") {
+      proxyTagsLoaded = false;
+      loadEnvs();
+      maybeAutoLoadTags();
+    }
+  } catch (_) {
+    el("adspowerKeyStatus").textContent = "保存失败，请检查端口、密钥和本机权限";
+  } finally {
+    adspowerSettingsBusy = false;
+    syncAdspowerSettingsButtons();
+  }
+}
+async function clearAdspowerSettings() {
+  if (adspowerSettingsBusy || adspowerTestBusy || jobStarting) return;
+  adspowerSettingsBusy = true;
+  adspowerSettingsRevision += 1;
+  syncAdspowerSettingsButtons();
+  el("adspowerKeyStatus").textContent = "清除中…";
+  try {
+    const data = await api("/api/settings/adspower", { method: "DELETE" });
+    if (data.configured !== false || !Number.isInteger(data.port)
+        || !normalizeAdspowerAddress(data.address)) throw new Error("invalid settings response");
+    adspowerConfigured = false;
+    adspowerSettingsLoaded = true;
+    adspowerSavedAddress = normalizeAdspowerAddress(data.address);
+    adspowerSavedPort = data.port;
+    el("adspowerAddress").value = adspowerSavedAddress;
+    el("adspowerPort").value = String(data.port);
+    el("apiKey").value = "";
+    el("adspowerKeyStatus").textContent = "配置已清除";
+    resetAdspowerEnvironments();
+    updateAdspowerTestPrompt();
+  } catch (_) {
+    el("adspowerKeyStatus").textContent = "清除失败，请重试";
+  } finally {
+    adspowerSettingsBusy = false;
+    syncAdspowerSettingsButtons();
+  }
+}
+async function testAdspowerConnection() {
+  if (adspowerSettingsBusy || adspowerTestBusy || !adspowerSettingsLoaded || !adspowerConfigured
+      || adspowerHasUnsavedChanges()) {
+    updateAdspowerTestPrompt();
+    return;
+  }
+  adspowerTestBusy = true;
+  syncAdspowerSettingsButtons();
+  el("adspowerTestStatus").textContent = "正在测试本机 AdsPower 连接…";
+  try {
+    const data = await api("/api/settings/adspower/test", { method: "POST" });
+    if (!data || data.ok !== true) throw new Error("connection test failed");
+    el("adspowerTestStatus").textContent = currentMode() === "adspower_temp"
+      ? "本机 API 已连接；临时环境创建权限将在运行时验证"
+      : "本机 API 已连接；密钥权限可通过“加载窗口”进一步确认";
+  } catch (_) {
+    el("adspowerTestStatus").textContent = "连接失败：请确认 AdsPower 已启动，地址、端口和 API Key 正确";
+  } finally {
+    adspowerTestBusy = false;
+    syncAdspowerSettingsButtons();
+  }
+}
+for (const id of ["adspowerAddress", "adspowerPort", "apiKey"]) {
+  el(id).addEventListener("input", () => { syncAdspowerSettingsButtons(); updateAdspowerTestPrompt(); });
+}
+el("adspowerSaveBtn").addEventListener("click", saveAdspowerSettings);
+el("adspowerTestBtn").addEventListener("click", testAdspowerConnection);
+el("adspowerClearBtn").addEventListener("click", clearAdspowerSettings);
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) loadAdspowerSettings().then(() => {
+    if (currentMode() === "adspower" && adspowerConfigured) { loadEnvs(); maybeAutoLoadTags(); }
+  });
+});
+syncAdspowerSettingsButtons();
 
 // 记住批量运行偏好。solve_close 只临时强制关窗，不能覆盖用户原来的普通保留选择。
 let keepOpenPreference = el("keepOpen").checked;
+// 临时 AdsPower 环境每次打开页面都默认关闭并移入回收站；手动保留只影响本页临时模式。
+let adspowerTempKeepOpenPreference = false;
 function loadFlags() {
   let f = {};
   try { f = JSON.parse(localStorage.getItem(LS.flags) || "{}"); } catch (_) { f = {}; }
@@ -1930,7 +2114,10 @@ el("randomFp").addEventListener("change", saveFlags);
 el("clearData").addEventListener("change", saveFlags);
 el("backgroundRun").addEventListener("change", saveFlags);
 el("keepOpen").addEventListener("change", () => {
-  if (el("manualChallengePolicy").value !== "solve_close") keepOpenPreference = el("keepOpen").checked;
+  if (el("manualChallengePolicy").value !== "solve_close") {
+    if (currentMode() === "adspower_temp") adspowerTempKeepOpenPreference = el("keepOpen").checked;
+    else keepOpenPreference = el("keepOpen").checked;
+  }
   saveFlags();
 });
 el("manualChallengePolicy").addEventListener("change", () => {
@@ -1953,7 +2140,8 @@ function syncCapsolverVisibility() {
   const forcedByPolicy = solveAndCloseSelected();
   // 自动打码策略强制启用 solver、强制普通结果不保留；退出后恢复进入前的用户偏好。
   el("capsolverEnabled").checked = forcedByPolicy || capsolverEnabledPreference;
-  el("keepOpen").checked = forcedByPolicy ? false : keepOpenPreference;
+  el("keepOpen").checked = forcedByPolicy ? false
+    : (currentMode() === "adspower_temp" ? adspowerTempKeepOpenPreference : keepOpenPreference);
   const enabled = el("capsolverEnabled").checked;
   const busy = capsolverSettingsBusy || jobStarting;
   // 保存配置和启用付费服务是独立操作，关闭时仍可保存、更换或清除密钥。
@@ -2085,22 +2273,27 @@ el("capsolverClearBtn").addEventListener("click", clearCapsolverKey);
 window.addEventListener("pageshow", (event) => { if (event.persisted) return loadCapsolverSettings(); });
 loadCapsolverPreferences();
 
-// ---- 运行模式：调用 AdsPower / 不调用 AdsPower（本机临时浏览器）----
+// ---- 运行模式：本机浏览器、复用 AdsPower 环境、创建 AdsPower 临时环境 ----
 function currentMode() {
   const r = document.querySelector('input[name="runMode"]:checked');
   return r ? r.value : "local";
 }
-// 本机模式只保留必要开关；AdsPower 专属配置在切到兼容模式后再显示。
+// 临时环境共用本机 AdsPower 连接，但不使用已有窗口、随机指纹或代理池。
 function syncModeVisibility() {
-  const local = currentMode() === "local";
+  const mode = currentMode();
+  const local = mode === "local";
+  const reuseAdsPower = mode === "adspower";
+  const temporaryAdsPower = mode === "adspower_temp";
   el("apiKeyField").hidden = local;
-  el("optRandomFp").hidden = local;
-  el("optProxy").hidden = local;
+  el("optRandomFp").hidden = !reuseAdsPower;
+  el("optProxy").hidden = !reuseAdsPower;
+  el("optClearData").hidden = temporaryAdsPower;
   el("optLocalProxy").hidden = true;
-  el("envField").hidden = local;
+  el("envField").hidden = !reuseAdsPower;
   el("localHint").hidden = true;
+  el("adspowerTempHint").hidden = !temporaryAdsPower;
   el("maxConcurrentLabel").textContent = local ? "并发数" : "最大并发";
-  if (local) { el("proxyBox").hidden = true; }
+  if (!reuseAdsPower) { el("proxyBox").hidden = true; }
   else { syncProxyVisibility(); }
 }
 function saveMode() { localStorage.setItem(LS.mode, currentMode()); }
@@ -2109,12 +2302,23 @@ function loadMode() {
   const r = document.querySelector(`input[name="runMode"][value="${saved}"]`);
   if (r) r.checked = true;
   syncModeVisibility();
+  syncCapsolverVisibility();
 }
 document.querySelectorAll('input[name="runMode"]').forEach((r) => {
   r.addEventListener("change", () => {
     saveMode();
     syncModeVisibility();
-    if (currentMode() === "adspower") { loadEnvs(); maybeAutoLoadTags(); }
+    syncCapsolverVisibility();
+    syncRunButton();
+    if (currentMode() === "adspower") {
+      if (adspowerSettingsLoaded) {
+        if (adspowerConfigured) { loadEnvs(); maybeAutoLoadTags(); }
+      } else {
+        loadAdspowerSettings().then(() => {
+          if (currentMode() === "adspower" && adspowerConfigured) { loadEnvs(); maybeAutoLoadTags(); }
+        });
+      }
+    }
   });
 });
 loadMode();
@@ -2131,7 +2335,7 @@ function saveProxyForm() {
   localStorage.setItem(LS.proxy, JSON.stringify(readProxyForm()));
 }
 function syncProxyVisibility() {
-  el("proxyBox").hidden = currentMode() === "local" || !el("useProxy").checked;
+  el("proxyBox").hidden = currentMode() !== "adspower" || !el("useProxy").checked;
 }
 function loadProxyForm() {
   let p = {};
@@ -2144,11 +2348,14 @@ function loadProxyForm() {
 let savedProxyTagId = "";
 let proxyTagsLoaded = false;
 async function loadProxyTags() {
-  const apiKey = el("apiKey").value.trim();
+  if (!adspowerConfigured) {
+    el("proxyTagBadge").textContent = "请先保存 AdsPower 密钥";
+    return;
+  }
   if (el("loadTagsBtn")) el("loadTagsBtn").disabled = true;
   el("proxyTagBadge").textContent = "加载中…";
   try {
-    const r = await api(`/api/automation/proxy-tags?apiKey=${encodeURIComponent(apiKey)}`);
+    const r = await api("/api/automation/proxy-tags");
     const sel = el("proxyTag");
     sel.innerHTML = `<option value="">全部代理（不限标签 · 共 ${r.total} 条）</option>`;
     (r.tags || []).forEach((t) => {
@@ -2179,6 +2386,17 @@ loadProxyForm();
 // ---- 窗口（环境）选择 ----
 let envProfiles = [];
 let envSelected = loadSet(LS.envs);
+let envLoadRevision = 0;
+
+function resetAdspowerEnvironments() {
+  envLoadRevision += 1; // 旧连接尚未完成的请求不能覆盖新连接窗口列表。
+  adspowerEnvsReady = false;
+  envProfiles = [];
+  envSelected = new Set();
+  saveSet(LS.envs, envSelected);
+  renderEnvs();
+  syncRunButton();
+}
 
 function filteredEnvs() {
   const q = el("envSearch").value.trim().toLowerCase();
@@ -2195,7 +2413,7 @@ function renderEnvs() {
   } else {
     el("envList").innerHTML = rows.map((e) => `
       <label class="env-item${envSelected.has(e.serial) ? " on" : ""}">
-        <input type="checkbox" data-serial="${e.serial}"${envSelected.has(e.serial) ? " checked" : ""} />
+        <input type="checkbox" data-serial="${e.serial}"${envSelected.has(e.serial) ? " checked" : ""}${adspowerEnvsReady ? "" : " disabled"} />
         <span class="env-name">${escapeHtml(e.name || "(未命名)")}</span>
         <span class="env-serial">#${escapeHtml(e.serial)}</span>
         ${e.group ? `<span class="env-group">${escapeHtml(e.group)}</span>` : ""}
@@ -2205,26 +2423,39 @@ function renderEnvs() {
   el("envBadge").textContent = envProfiles.length ? `${envSelected.size}/${envProfiles.length} 选中` : "未加载";
   const all = el("envSelectAll");
   all.checked = rows.length > 0 && rows.every((e) => envSelected.has(e.serial));
+  all.disabled = !adspowerEnvsReady;
 }
 
 async function loadEnvs() {
+  if (!adspowerConfigured) {
+    adspowerEnvsReady = false;
+    syncRunButton();
+    el("envBadge").textContent = "请先保存 AdsPower 密钥";
+    return;
+  }
+  const revision = ++envLoadRevision;
+  adspowerEnvsReady = false;
+  syncRunButton();
+  renderEnvs();
   el("loadEnvsBtn").disabled = true;
   el("envBadge").textContent = "加载中…";
   try {
-    const q = el("apiKey").value.trim() ? `?apiKey=${encodeURIComponent(el("apiKey").value.trim())}` : "";
-    const data = await api(`/api/automation/envs${q}`);
-    envProfiles = data.envs || [];
-    // 保留仍存在的已选项（仅在确实拿到列表时才裁剪，避免加载失败清空已存选择）
-    if (envProfiles.length) {
-      envSelected = new Set([...envSelected].filter((s) => envProfiles.some((e) => e.serial === s)));
-      saveSet(LS.envs, envSelected);
-    }
+    const data = await api("/api/automation/envs");
+    if (revision !== envLoadRevision || !adspowerConfigured) return;
+    if (!data || !Array.isArray(data.envs)) throw new Error("invalid environment response");
+    envProfiles = data.envs;
+    // 只保留此连接确实返回的窗口；空列表也要清掉本地选择。
+    envSelected = new Set([...envSelected].filter((s) => envProfiles.some((e) => e.serial === s)));
+    saveSet(LS.envs, envSelected);
+    adspowerEnvsReady = true;
     renderEnvs();
-  } catch (err) {
-    el("envList").innerHTML = `<span class="muted">${escapeHtml(err.message)}</span>`;
+    syncRunButton();
+  } catch (_) {
+    if (revision !== envLoadRevision) return;
+    el("envList").innerHTML = '<span class="muted">加载窗口失败：请确认 AdsPower 连接与 API Key。</span>';
     el("envBadge").textContent = "加载失败";
   } finally {
-    el("loadEnvsBtn").disabled = false;
+    if (revision === envLoadRevision) el("loadEnvsBtn").disabled = false;
   }
 }
 el("loadEnvsBtn").addEventListener("click", loadEnvs);
@@ -2232,6 +2463,7 @@ el("loadEnvsBtn").addEventListener("click", loadEnvs);
 el("envSearch").addEventListener("input", renderEnvs);
 
 el("envList").addEventListener("change", (e) => {
+  if (!adspowerEnvsReady) { renderEnvs(); return; }
   if (!e.target.matches("input[type=checkbox]")) return;
   const s = e.target.dataset.serial;
   if (e.target.checked) envSelected.add(s); else envSelected.delete(s);
@@ -2240,6 +2472,7 @@ el("envList").addEventListener("change", (e) => {
 });
 
 el("envSelectAll").addEventListener("change", (e) => {
+  if (!adspowerEnvsReady) { renderEnvs(); return; }
   const rows = filteredEnvs();
   if (e.target.checked) rows.forEach((x) => envSelected.add(x.serial));
   else rows.forEach((x) => envSelected.delete(x.serial));
@@ -2294,6 +2527,16 @@ async function startJob(ids) {
   }
   const mode = currentMode();
   const local = mode === "local";
+  const reuseAdsPower = mode === "adspower";
+  const temporaryAdsPower = mode === "adspower_temp";
+  if (!local && (!adspowerSettingsLoaded || !adspowerConfigured || adspowerSettingsBusy)) {
+    el("runStatus").textContent = "请先保存 AdsPower 连接设置";
+    return;
+  }
+  if (reuseAdsPower && !adspowerEnvsReady) {
+    el("runStatus").textContent = "请先成功刷新当前 AdsPower 连接的窗口列表";
+    return;
+  }
   // 启动可能先等待密钥保存；先快照策略、保留与后台开关，避免等待期间 UI 变化造成请求字段互相矛盾。
   const manualChallengePolicy = el("manualChallengePolicy").value;
   const solveAndClose = manualChallengePolicy === "solve_close";
@@ -2301,11 +2544,11 @@ async function startJob(ids) {
   const background = el("backgroundRun").checked;
   const accountIds = [...ids];
   const actionIds = [...document.querySelectorAll('#actionList input:checked')].map((c) => c.value);
-  const envSerials = [...envSelected];
-  if (!local && !envSerials.length) { el("runStatus").textContent = "请先加载并勾选至少一个窗口"; return; }
+  const envSerials = reuseAdsPower ? [...envSelected] : [];
+  if (reuseAdsPower && !envSerials.length) { el("runStatus").textContent = "请先加载并勾选至少一个窗口"; return; }
   if (!accountIds.length) { el("runStatus").textContent = "请先在账号库勾选账号"; return; }
   if (!actionIds.length) { el("runStatus").textContent = "请选择至少一个操作"; return; }
-  const proxy = local ? null : readProxyForm();
+  const proxy = reuseAdsPower ? readProxyForm() : null;
   let captchaSolver;
   try {
     captchaSolver = readCapsolverForm(actionIds, proxy);
@@ -2325,11 +2568,10 @@ async function startJob(ids) {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({
         mode,
-        apiKey: el("apiKey").value.trim(),
-        envs: local ? [] : envSerials,
+        envs: envSerials,
         maxConcurrent: Number(el("maxConcurrent").value) || 3,
-        randomFp: el("randomFp").checked,
-        clearData: el("clearData").checked,
+        randomFp: temporaryAdsPower ? false : el("randomFp").checked,
+        clearData: temporaryAdsPower ? false : el("clearData").checked,
         background,
         keepOpen,
         manualChallengePolicy,
@@ -2438,6 +2680,7 @@ function captchaProgressHtml(captcha) {
 function taskNeedsAttention(t) {
   if (!t) return false;
   if (t.error) return true;
+  if (t.cleanupState === "failed" || t.cleanupState === "unconfirmed") return true;
   if (t.status === "cancelled") return true;
   for (const r of (t.results || [])) {
     if (!r) continue;
@@ -2477,7 +2720,7 @@ function renderJob(job) {
     // 折叠态：用户手动 toggle 过的以记录为准；否则需人工默认展开、正常默认折叠。
     const expanded = jobManualExpand.has(t.email) ? jobManualExpand.get(t.email) : needs;
     // 逐条动作结果 + 人话提示（detail），换 2FA 等关键写操作的成功/失败一眼可见。
-    const lines = (t.results || []).map((r) => {
+    let lines = (t.results || []).map((r) => {
       const msg = r.detail ? Object.values(r.detail).filter(Boolean).join("；") : "";
       const cloudPhoneCheck = r.action === "detect-cloud-phone" && r.fieldPatch && r.fieldPatch.lastCloudPhoneCheck;
       const cloudPhoneState = cloudPhoneCheck && cloudPhoneCheck.state;
@@ -2493,6 +2736,16 @@ function renderJob(job) {
         : (JOB_OUTCOME_TEXT[r.outcome] || r.outcome));
       return `<div class="job-line out-${neutralCloudResult ? "neutral" : escapeHtml(r.outcome)}">${mark} ${escapeHtml(actionText)}：${escapeHtml(outcomeText)}${msg ? " — " + escapeHtml(msg) : ""}</div>`;
     }).join("");
+    if (job.mode === "adspower_temp") {
+      const cleanupText = {
+        trashed: "临时环境已移入 AdsPower 回收站；如需立即永久删除，请手动清空",
+        retained: "临时窗口已保留，关闭后才会移入回收站",
+        failed: "临时环境清理未完成，请点“重试停止并关闭”",
+        unconfirmed: `创建结果未确认；请在 AdsPower 搜索 am-temp-${t.cleanupMarker || ""} 核查`,
+        not_created: "未创建临时环境",
+      }[t.cleanupState];
+      if (cleanupText) lines += `<div class="job-line out-${t.cleanupState === "failed" || t.cleanupState === "unconfirmed" ? "error" : "neutral"}">• ${escapeHtml(cleanupText)}</div>`;
+    }
     const head = t.error ? `错误：${t.error}` : (JOB_STATUS_TEXT[t.status] || t.status);
     return `<div class="job-task ${t.status}${needs ? " needs-attn" : ""}${expanded ? "" : " folded"}" data-email="${escapeHtml(t.email)}">
       <div class="job-task-head">
@@ -3286,15 +3539,6 @@ Promise.all([loadAccounts(), loadActions(), loadCapsolverSettings()])
   .finally(() => { syncRunButton(); });
 loadCards();
 loadPhones();
-// 仅在 AdsPower 模式下自动加载窗口/代理；本机模式不发起任何 AdsPower 请求。
-if (currentMode() === "adspower") {
-  loadEnvs();
-  maybeAutoLoadTags();
-}
-// API Key 改了只在 AdsPower 模式重拉窗口和标签，本机模式不发 AdsPower 请求。
-el("apiKey").addEventListener("change", () => {
-  if (currentMode() !== "adspower") return;
-  loadEnvs();
-  proxyTagsLoaded = false;
-  maybeAutoLoadTags();
+loadAdspowerSettings().then(() => {
+  if (currentMode() === "adspower" && adspowerConfigured) { loadEnvs(); maybeAutoLoadTags(); }
 });

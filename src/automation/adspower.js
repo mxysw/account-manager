@@ -1,12 +1,102 @@
 "use strict";
 
 const http = require("http");
+const adsSettings = require("../adspower-settings");
 
-/** 轻量 AdsPower Local API 客户端（默认 http://127.0.0.1:50325）。 */
+function validProfileId(value) {
+  if (typeof value !== "string" || !/^[^\s\x00-\x1f\x7f]{1,128}$/.test(value)) {
+    throw new Error("AdsPower profile_id 无效");
+  }
+  return value;
+}
+
+/** 轻量 AdsPower Local API 客户端，仅连接本机保存的 Local API 端口。 */
 class AdsPower {
   constructor(opts = {}) {
-    this.base = opts.base || "http://127.0.0.1:50325";
+    const base = opts.base || adsSettings.getBase();
+    const match = /^http:\/\/127\.0\.0\.1:([0-9]{1,5})\/?$/.exec(base);
+    if (!match) {
+      throw new Error("AdsPower 只允许连接 127.0.0.1 的本地 API 端口");
+    }
+    const port = adsSettings.validPort(match[1]);
+    this.base = `http://127.0.0.1:${port}`;
     this.apiKey = opts.apiKey || "";
+    const owned = opts.ownedProfileIds || [];
+    if (!Array.isArray(owned) && !(owned instanceof Set)) throw new Error("临时环境 ID 列表无效");
+    this.ownedProfileIds = new Set([...owned].map(validProfileId));
+  }
+
+  _ownedProfileId(value) {
+    const profileId = validProfileId(value);
+    if (!this.ownedProfileIds.has(profileId)) throw new Error("仅允许操作本系统创建的临时环境");
+    return profileId;
+  }
+
+  /** V2 临时环境：只写本系统标记，不把站点账号、密码或 2FA 密钥交给 AdsPower。 */
+  async createTempProfile({ marker } = {}) {
+    if (typeof marker !== "string" || !/^[A-Za-z0-9-]{8,64}$/.test(marker)) {
+      throw new Error("临时环境标记无效");
+    }
+    const label = `am-temp-${marker}`;
+    const response = await this._request("POST", "/api/v2/browser-profile/create", {}, {
+      group_id: "0",
+      name: label,
+      remark: `account-manager-owned:${marker}`,
+      username: label,
+      user_proxy_config: { proxy_soft: "no_proxy" },
+      fingerprint_config: { screen_resolution: "none" },
+    });
+    const profileId = response && response.code === 0 && response.data && response.data.profile_id;
+    if (!profileId) throw new Error("AdsPower 临时环境创建未返回 profile_id");
+    validProfileId(profileId);
+    this.ownedProfileIds.add(profileId);
+    return { profileId, profileNo: String(response.data.profile_no || ""), marker };
+  }
+
+  /** V2 启动：始终关闭 AdsPower 自带的密码保存与自动填充。 */
+  async startProfile(profileId) {
+    const id = this._ownedProfileId(profileId);
+    const response = await this._request("POST", "/api/v2/browser-profile/start", {}, {
+      profile_id: id,
+      password_filling: "0",
+      password_saving: "0",
+    }, 90000);
+    if (!response || response.code !== 0) throw new Error("AdsPower 临时环境启动失败");
+    const cdpEndpoint = this._cdpFromData(response.data);
+    if (!cdpEndpoint) throw new Error("AdsPower 临时环境未返回调试地址");
+    return { profileId: id, cdpEndpoint };
+  }
+
+  async stopProfile(profileId) {
+    const id = this._ownedProfileId(profileId);
+    const response = await this._request("POST", "/api/v2/browser-profile/stop", {}, { profile_id: id });
+    if (!response || response.code !== 0) throw new Error("AdsPower 临时环境关闭失败");
+    return { profileId: id, stopped: true };
+  }
+
+  async profileStatus(profileId) {
+    const id = this._ownedProfileId(profileId);
+    const response = await this._request("GET", "/api/v2/browser-profile/active", { profile_id: id });
+    const status = response && response.code === 0 && response.data && response.data.status;
+    if (status !== "Active" && status !== "Inactive") throw new Error("AdsPower 临时环境状态未确认");
+    return { profileId: id, status };
+  }
+
+  /** 再次确认关闭后仅删除一个精确的自有 ID；所有权记录由上层持久账本管理。 */
+  async deleteProfile(profileId) {
+    const id = this._ownedProfileId(profileId);
+    const state = await this.profileStatus(id);
+    if (state.status !== "Inactive") throw new Error("AdsPower 临时环境仍在运行，不能删除");
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const response = await this._request("POST", "/api/v2/browser-profile/delete", {}, { profile_id: [id] });
+    if (!response || response.code !== 0) throw new Error("AdsPower 临时环境删除失败");
+    return { profileId: id, deleted: true };
+  }
+
+  /** 官方只读 /status：仅确认当前本机 Local API 可用。 */
+  async checkConnection() {
+    const response = await this._request("GET", "/status", {}, null, 5000);
+    return !!(response && response.code === 0);
   }
 
   _request(method, pathname, query = {}, body = null, timeoutMs = 20000) {

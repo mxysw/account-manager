@@ -45,6 +45,8 @@ function harness(storage = new Map()) {
     let cancelError = "", jobPollError = "", jobStateEpoch = 0;
     let capsolverSettingsBusy = false, capsolverEnabledPreference = false;
     let capsolverConfigured = false, capsolverSettingsLoaded = true;
+    let adspowerConfigured = true, adspowerSettingsLoaded = true, adspowerSettingsBusy = false;
+    let adspowerEnvsReady = true;
     const envSelected = new Set(["fixture-env"]), accounts = [], jobManualExpand = new Map();
     ${extract("// 记住批量运行偏好", "// ---- CAPSOLVER")}
     ${extract("function solveAndCloseSelected()", "function saveCapsolverPreferences()")}
