@@ -1,5 +1,7 @@
 "use strict";
 
+const { createBackgroundWindowController } = require("./background-window");
+
 /**
  * 通过 CDP 接管 AdsPower 已打开的浏览器。
  *
@@ -89,18 +91,124 @@ function toBrowserURL(cdpEndpoint) {
   throw new Error(`无法解析 CDP 地址：${cdpEndpoint}`);
 }
 
+function boundedCall(operation, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} 超时`)), timeoutMs);
+    Promise.resolve().then(operation).then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+/** CDP 挂起不能阻塞后续关闭专有浏览器进程。这里只关当前标签/连接，不关闭其它用户窗口。 */
+function createSessionClose(page, browser, cleanup = () => {}) {
+  let closing = null;
+  let closed = false;
+  return function close(options = {}) {
+    if (closed) return Promise.resolve({ ok: true });
+    if (closing) return closing;
+    const timeoutMs = Math.min(10000, Math.max(1, Number(options.timeoutMs) || 1500));
+    closing = (async () => {
+      const errors = [];
+      cleanup();
+      try { await boundedCall(() => page.close(), timeoutMs, "关闭标签页"); }
+      catch (error) { errors.push(error.message); }
+      // page.close 失败/超时也必须断开 CDP，让上层继续 local.stop / ads.stop。
+      try { await boundedCall(() => browser.disconnect(), timeoutMs, "断开浏览器连接"); }
+      catch (error) { errors.push(error.message); }
+      closed = errors.length === 0;
+      return closed ? { ok: true } : { ok: false, error: errors.join("；") };
+    })().finally(() => { closing = null; });
+    return closing;
+  };
+}
+
+function connectAbortError() {
+  const error = new Error("任务已取消");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  return error;
+}
+
+// 不依赖 Puppeteer 的内部 Promise 能否被中止；迟到得到的连接/页面仍按本次所有权回收。
+function connectStep(signal, operation, disposeLate = () => {}) {
+  if (signal && signal.aborted) return Promise.reject(connectAbortError());
+  return new Promise((resolve, reject) => {
+    let cancelled = false;
+    const onAbort = () => { cancelled = true; reject(connectAbortError()); };
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve().then(() => {
+      if (signal && signal.aborted) throw connectAbortError();
+      return operation();
+    }).then((value) => {
+      if (cancelled || (signal && signal.aborted)) {
+        void Promise.resolve().then(() => disposeLate(value)).catch(() => {});
+        reject(connectAbortError());
+      } else resolve(value);
+    }, reject).finally(() => {
+      if (signal) signal.removeEventListener("abort", onAbort);
+    });
+  });
+}
+
 /**
  * 连接并返回一个可操作的新标签页。
  * @returns {{ browser, page, close }}
  */
-async function connect(cdpEndpoint) {
-  const puppeteer = loadPuppeteer();
+async function connect(cdpEndpoint, options = {}, deps = {}) {
+  const signal = options.signal;
+  if (signal && signal.aborted) throw connectAbortError();
+  const puppeteer = deps.puppeteer || loadPuppeteer();
   const browserURL = toBrowserURL(cdpEndpoint);
   let browser = null;
   let page = null;
+  let background = null;
+  let onTargetCreated = null;
+  let hooksDisposed = false;
+  const disposeHooks = () => {
+    if (hooksDisposed) return;
+    hooksDisposed = true;
+    if (background) background.dispose();
+    if (signal) signal.removeEventListener("abort", disposeHooks);
+    if (browser) {
+      const remove = (event, handler) => {
+        if (!handler) return;
+        if (typeof browser.off === "function") browser.off(event, handler);
+        else if (typeof browser.removeListener === "function") browser.removeListener(event, handler);
+      };
+      remove("targetcreated", onTargetCreated);
+      remove("disconnected", disposeHooks);
+    }
+  };
+  const disposedPages = new WeakSet();
+  const disposedBrowsers = new WeakSet();
+  const disposePage = (value) => {
+    if (!value || disposedPages.has(value)) return Promise.resolve();
+    disposedPages.add(value);
+    return boundedCall(() => value.close(), 1500, "取消时关闭标签页").catch(() => {});
+  };
+  const disposeBrowser = (value) => {
+    if (!value || disposedBrowsers.has(value)) return Promise.resolve();
+    disposedBrowsers.add(value);
+    return boundedCall(() => value.disconnect(), 1500, "取消时断开浏览器").catch(() => {});
+  };
+  const disposeCancelled = () => {
+    disposeHooks();
+    // 必须立刻断开已获得的 CDP，不能让一个挂起的 page.close/newPage 阻挡取消。
+    void disposeBrowser(browser);
+    void disposePage(page);
+  };
+  if (signal) signal.addEventListener("abort", disposeCancelled, { once: true });
   try {
-    browser = await puppeteer.connect({ browserURL, defaultViewport: null, targetFilter });
-    page = await browser.newPage();
+    browser = await connectStep(signal, () => puppeteer.connect({ browserURL, defaultViewport: null, targetFilter }), disposeBrowser);
+    if (options.background === true) {
+      background = createBackgroundWindowController(browser, {
+        signal, onWarning: options.onBackgroundWarning, timeoutMs: deps.backgroundTimeoutMs,
+      });
+    }
+    page = await connectStep(signal, () => browser.newPage(), disposePage);
+    if (background) await connectStep(signal, () => background.minimize(page.target()));
     // 兼容动作模块里用到的 Playwright 风格 API。
     if (typeof page.waitForTimeout !== "function") {
       page.waitForTimeout = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -111,21 +219,32 @@ async function connect(cdpEndpoint) {
     //   1) 主操作 page 直接初始化；
     //   2) 监听 targetcreated，让后续 newPage（如 login 重试新开的干净 page、label 标识页）也自动覆盖到，
     //      这样所有动作经 connect 拿到的 page 都不会被原生弹窗卡住、也不会被后台节流。
-    await initPage(page);
+    await connectStep(signal, () => (deps.initPage || initPage)(page));
+    if (signal && signal.aborted) throw connectAbortError();
   } catch (err) {
+    disposeHooks();
+    if (signal && signal.aborted) {
+      disposeCancelled();
+      throw connectAbortError();
+    }
     // 冷启动重试前先清掉半连接，避免同一个 CDP 端点残留多个 Puppeteer 会话。
-    if (page) { try { await page.close(); } catch (_) { /* ignore */ } }
-    if (browser) { try { await browser.disconnect(); } catch (_) { /* ignore */ } }
+    if (page || browser) await createSessionClose(page || { close() {} }, browser || { disconnect() {} })();
     throw err;
+  } finally {
+    if (signal) signal.removeEventListener("abort", disposeCancelled);
   }
-  browser.on("targetcreated", async (target) => {
+  onTargetCreated = async (target) => {
     try {
+      if (hooksDisposed) return;
       const t = typeof target.type === "function" ? target.type() : target.type;
       if (t !== "page") return;
       const p = await target.page();
-      if (p) await initPage(p);
+      if (p && !hooksDisposed) await initPage(p);
     } catch (_) { /* ignore：拿不到 page（SW/插页等）就跳过 */ }
-  });
+  };
+  browser.on("targetcreated", onTargetCreated);
+  browser.on("disconnected", disposeHooks);
+  if (signal) signal.addEventListener("abort", disposeHooks, { once: true });
   return {
     browser,
     page,
@@ -149,11 +268,7 @@ async function connect(cdpEndpoint) {
         return { ok: false, error: err.message };
       }
     },
-    async close() {
-      try { await page.close(); } catch (_) { /* ignore */ }
-      // 只断开连接，不关闭 AdsPower 的浏览器本体。
-      try { await browser.disconnect(); } catch (_) { /* ignore */ }
-    },
+    close: createSessionClose(page, browser, disposeHooks),
     /**
      * 抓取当前浏览器里的全部 cookie（跨所有域，用于养号免密登录）。
      * 用 CDP Network.getAllCookies 拿浏览器级全量 cookie（含 HttpOnly/分区 cookie），
@@ -209,10 +324,7 @@ async function connect(cdpEndpoint) {
       const lines = (Array.isArray(summary) ? summary : (summary ? [summary] : []))
         .map((s) => String(s).trim())
         .filter(Boolean);
-      const withTimeout = (p, ms, tag) => Promise.race([
-        Promise.resolve(p),
-        new Promise((_, rej) => setTimeout(() => rej(new Error(`label.${tag} 超时`)), ms)),
-      ]);
+      const withTimeout = (p, ms, tag) => boundedCall(() => p, ms, `label.${tag}`);
       const esc = (s) => String(s).replace(/[&<>"']/g, (c) => (
         { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
       ));
@@ -249,7 +361,8 @@ async function connect(cdpEndpoint) {
         // 双保险：setContent 后再强制设一次 title（部分环境 <title> 解析时机不稳）。
         await withTimeout(labelPage.evaluate((t) => { document.title = t; }, title), 5000, "title")
           .catch(() => { /* 标题设置失败不影响整体 */ });
-        try { await labelPage.bringToFront(); } catch (_) { /* ignore */ }
+        if (background) await background.minimize(labelPage.target());
+        else { try { await labelPage.bringToFront(); } catch (_) { /* ignore */ } }
         return { ok: true, email: safeEmail };
       } catch (err) {
         return { ok: false, error: err.message };
@@ -257,9 +370,10 @@ async function connect(cdpEndpoint) {
     },
     /** 只断开自动化连接，保留标签和窗口（用于「不关闭窗口」）。 */
     async disconnect() {
+      disposeHooks();
       try { await browser.disconnect(); } catch (_) { /* ignore */ }
     },
   };
 }
 
-module.exports = { connect, targetFilter, toBrowserURL };
+module.exports = { connect, targetFilter, toBrowserURL, helpers: { boundedCall, createSessionClose, connectStep } };

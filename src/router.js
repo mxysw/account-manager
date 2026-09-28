@@ -10,8 +10,17 @@ const engine = require("./automation/engine");
 const { AdsPower } = require("./automation/adspower");
 const adsCli = require("./automation/ads-cli");
 const timeSync = require("./automation/time-sync");
+const capsolverSettings = require("./capsolver-settings");
 
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
+
+function sameOriginSettingsRequest(req) {
+  if (req.headers["sec-fetch-site"] === "cross-site") return false;
+  const origin = req.headers.origin;
+  if (!origin) return true; // 本机 CLI 与同源测试不一定带 Origin。
+  try { return new URL(origin).origin === new URL(`http://${req.headers.host}`).origin; }
+  catch (_) { return false; }
+}
 
 function sendJson(res, status, data) {
   res.writeHead(status, {
@@ -436,6 +445,24 @@ const ROUTES = [
   }],
 
   // ---- 自动化 ----
+  ["GET", /^\/api\/settings\/capsolver$/, (req) => {
+    if (!sameOriginSettingsRequest(req)) return { status: 403, body: { error: "仅允许本机同源配置请求" } };
+    try { return { status: 200, body: capsolverSettings.status() }; }
+    catch (_) { return { status: 500, body: { error: "CAPSOLVER 配置读取失败，请重新保存" } }; }
+  }],
+  ["PUT", /^\/api\/settings\/capsolver$/, async (req) => {
+    if (!sameOriginSettingsRequest(req)) return { status: 403, body: { error: "仅允许本机同源配置请求" } };
+    if (!/^application\/json(?:\s*;|$)/i.test(req.headers["content-type"] || "")) return { status: 415, body: { error: "请使用 JSON 保存配置" } };
+    try {
+      const body = await readBody(req);
+      return { status: 200, body: capsolverSettings.save(body && body.apiKey) };
+    } catch (_) { return { status: 400, body: { error: "CAPSOLVER 密钥保存失败，请检查输入和本机权限" } }; }
+  }],
+  ["DELETE", /^\/api\/settings\/capsolver$/, (req) => {
+    if (!sameOriginSettingsRequest(req)) return { status: 403, body: { error: "仅允许本机同源配置请求" } };
+    try { return { status: 200, body: capsolverSettings.clear() }; }
+    catch (_) { return { status: 500, body: { error: "CAPSOLVER 配置清除失败" } }; }
+  }],
   ["GET", /^\/api\/automation\/actions$/, () => ({ status: 200, body: { actions: engine.listActions() } })],
 
   ["GET", /^\/api\/automation\/envs$/, async (req, m, url) => {
@@ -462,6 +489,18 @@ const ROUTES = [
 
   ["POST", /^\/api\/automation\/run$/, async (req) => {
     const body = await readBody(req);
+    const autoSolve = body.manualChallengePolicy === "solve_close";
+    if ((autoSolve || (body.captchaSolver && body.captchaSolver.enabled === true)) && !sameOriginSettingsRequest(req)) {
+      return { status: 403, body: { error: "仅允许同源页面启用 CAPSOLVER" } };
+    }
+    let captchaOptions = body.captchaSolver;
+    if (autoSolve) {
+      if (captchaOptions != null && captchaOptions !== false && (typeof captchaOptions !== "object" || Array.isArray(captchaOptions))) {
+        return { status: 400, body: { error: "CAPSOLVER 配置无效" } };
+      }
+      // 第三种策略本身就是启用指令，不要求额外勾选独立 CAPSOLVER 开关。
+      captchaOptions = { ...(captchaOptions || {}), enabled: true };
+    }
     const apiKey = String(body.apiKey || "").trim();
     const mode = body.mode === "local" ? "local" : "adspower";
     const envSerials = Array.isArray(body.envs) ? body.envs : String(body.envs || "").split(/[\s,，;；]+/).filter(Boolean);
@@ -493,8 +532,10 @@ const ROUTES = [
         apiKey, mode, envSerials, accountIds, actionIds,
         maxConcurrent: body.maxConcurrent, targets: body.targets,
         randomFp: body.randomFp, clearData: body.clearData, keepOpen: body.keepOpen,
+        background: body.background,
         manualChallengePolicy: body.manualChallengePolicy,
         phoneMode: body.phoneMode,
+        captchaSolver: capsolverSettings.resolveConfig(captchaOptions),
         proxy,
       });
     } catch (err) {

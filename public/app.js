@@ -24,11 +24,19 @@ const LOGIN_REASON_TEXT = {
   totp_missing: "缺少2FA密钥",
   totp_invalid: "2FA密钥错误",
   totp_flow_error: "2FA验证异常",
+  recovery_email_missing: "缺少辅助邮箱",
+  recovery_email_wrong: "辅助邮箱错误",
+  recovery_email_code_required: "需邮箱验证码",
   captcha: "人机验证",
+  captcha_detection_failed: "检测异常",
   device_prompt: "设备通知验证",
   sms_verification: "短信验证",
+  phone_add_required: "需添加手机号",
+  phone_verification_required: "需手机短信验证",
+  captcha_phone_add_required: "人机后需添加手机号",
+  captcha_phone_verification_required: "人机后需手机验证",
   security_code: "安全代码验证",
-  no_supported_2fa: "无身份验证器",
+  no_supported_2fa: "无可用验证方式",
   risk_verification: "风控/人工验证",
   browser_blocked: "浏览器被拦",
   browser_start_failed: "浏览器启动失败",
@@ -117,6 +125,7 @@ const LS = {
   apiKey: "am_apiKey", envs: "am_envs", max: "am_max", proxy: "am_proxy",
   accounts: "am_sel_accounts", actions: "am_sel_actions", flags: "am_flags",
   mode: "am_mode", job: "am_jobId", filterSale: "am_filter_sale",
+  closeJob: "am_closeJobId", cancelJob: "am_cancelJobId",
   // 养号管理视图的销售状态筛选，刷新后保持（与出售管理 filterSale 各自独立）。
   filterNurtureSale: "am_filter_nurture_sale",
   // 顶部 dock 当前视图：detect 检测系统 / nurture 养号管理 / scrap 废号管理 / sales 出售管理。刷新后停留在同一视图。
@@ -141,6 +150,16 @@ function loadActionsSet(v) {
 function applyActionChecks() {
   const set = loadActionsSet(currentView);
   document.querySelectorAll('#actionList input[type="checkbox"]').forEach((c) => { c.checked = set.has(c.value); });
+  syncCloudPhoneOptions();
+}
+
+function syncCloudPhoneOptions() {
+  const options = el("cloudPhoneOptions");
+  if (!options) return;
+  const selectedAction = document.querySelector('#actionList input[value="detect-cloud-phone"]:checked');
+  options.hidden = !selectedAction;
+  // 条款同意不跨动作/视图沿用，也不写入本地长期偏好。
+  if (!selectedAction) el("cloudPhoneAcceptTerms").checked = false;
 }
 
 // 分类「库」：unchecked 未检测 / none 未分类 / sell 出售 / nurture 养号 / scrap 废号。
@@ -179,9 +198,20 @@ let jobId = null;
 let jobPolling = false;
 let jobStarting = false;
 let appReady = false;
+// 运行任务与“最后一个任务的待关闭窗口”分开，保留窗口不阻止新批次，也不遗失关闭入口。
+let closeTargetId = null;
+let trackedJob = null;
+let cancelInFlight = false;
+let cancelIntent = false;
+let cancelError = "";
+let jobPollError = "";
+let jobPollTarget = null;
+let jobStateEpoch = 0;
+let jobRefreshRunning = false;
 
 function syncRunButton() {
-  el("runBtn").disabled = !appReady || jobStarting || !!jobId || jobPolling;
+  el("runBtn").disabled = !appReady || jobStarting || !!jobId || cancelInFlight;
+  syncStopButton();
 }
 // 运行日志：最近一次渲染过的 job（用于筛选开关切换时本地重渲染，无需等下一轮轮询）。
 let lastJob = null;
@@ -210,7 +240,50 @@ const isAbnormal = (a) => hasPasswordCheckIssue(a) || a.status.gmail === "banned
   || a.status.gpt === "cf_blocked" || a.status.restrict === "restricted"
   || a.status.login === "2fa_error" || a.status.login === "failed" || a.status.login === "need_verify"
   || STATUS_KEYS.some((k) => a.status[k] === "blocked" || a.status[k] === "rejected" || a.status[k] === "seckey" || a.status[k] === "pending");
-const isUnchecked = (a) => !a.lastPasswordCheck && STATUS_KEYS.every((k) => (a.status[k] || "unknown") === "unknown");
+const isUnchecked = (a) => !a.lastPasswordCheck && !a.lastCloudPhoneCheck && STATUS_KEYS.every((k) => (a.status[k] || "unknown") === "unknown");
+
+const CLOUD_PHONE_STATE_TEXT = {
+  new_number_allowed: "可填新号", existing_phone_required: "需原号", unknown: "未确认",
+};
+const CLOUD_PHONE_SIGNAL_NOTE = "仅表示本次 Cloud 验证页信号，不证明历史上是否绑定过初始手机号。";
+
+// 固定文案由状态与原因码决定，历史记录无需改写，详情也不参与判定。
+function cloudPhoneResultText(check, expanded = false) {
+  if (!check || typeof check !== "object" || Array.isArray(check)) return "";
+  if (check.state === "new_number_allowed") return expanded ? "可填新号（本次验证）" : "可填新号";
+  if (check.state === "existing_phone_required") return "需原号";
+  if (check.state === "unknown") {
+    switch (check.reasonCode) {
+      case "qr_verification_required": return expanded ? "需扫码（原号未确认）" : "需扫码";
+      case "no_challenge": return expanded ? "Shell 可用：已直接进入终端，本次无需手机号验证；未触发原号核验，无法判断是否绑定原号" : "Shell 可用";
+      case "cloud_unavailable": return expanded ? "Shell 不可用：服务不可用或账号不符合使用资格，原号检测受阻；手机号状态未知，不能据此认定账号被封禁" : "Shell 不可用";
+      case "cloud_disabled": return expanded ? "Shell 已停用：服务明确被停用、暂停或封禁，无法通过此入口检测原号；手机号状态未知，不代表整个 Google 账号被封禁" : "Shell 已停用";
+      case "cloud_authorization_required": return expanded ? "Shell 待授权：需要 API 授权，检测未继续，也未授予权限；无法判断是否绑定原号" : "Shell 待授权";
+    }
+  }
+  return "未确认";
+}
+
+function cloudPhoneStateOf(a) {
+  const check = a && a.lastCloudPhoneCheck;
+  if (!check || typeof check !== "object") return "unchecked";
+  return Object.prototype.hasOwnProperty.call(CLOUD_PHONE_STATE_TEXT, check.state) ? check.state : "unknown";
+}
+
+function cloudPhoneCellHtml(a) {
+  const state = cloudPhoneStateOf(a);
+  const check = a && a.lastCloudPhoneCheck;
+  if (state === "unchecked") return `<td class="cloud-phone-cell"><span class="muted" title="尚未执行原号检测">未检测</span></td>`;
+  const needsQr = state === "unknown" && check.reasonCode === "qr_verification_required";
+  const shellNote = state === "unknown" ? [
+    ["no_challenge", "本次无需手机验证；原号未知"],
+    ["cloud_unavailable", "检测受阻；手机号状态未知"],
+    ["cloud_disabled", "服务已停用；原号检测受阻"],
+    ["cloud_authorization_required", "授权未完成；原号未知"],
+  ].find(([reason]) => reason === check.reasonCode)?.[1] : "";
+  const title = [CLOUD_PHONE_SIGNAL_NOTE, cloudPhoneResultText(check, true), needsQr ? "需扫码验证，原号未确认；扫码页不能证明未绑定手机号。" : "", diagnosticDetailText(check), fmtTime(check.checkedAt)].filter(Boolean).join("\n");
+  return `<td class="cloud-phone-cell"><span class="cloud-phone-badge ${state}" tabindex="0" title="${escapeHtml(title)}">${cloudPhoneResultText(check) || CLOUD_PHONE_STATE_TEXT[state]}</span>${shellNote ? `<span class="cloud-phone-note">${escapeHtml(shellNote)}</span>` : ""}</td>`;
+}
 
 async function api(path, options) {
   const res = await fetch(path, options);
@@ -249,13 +322,13 @@ function visibleTableWrap() {
 // 轮询期间的“软刷新”：拉取最新账号数据并重渲染，但保住用户当前的
 // 勾选（selected 为模块级集合，render 会按它回填）、筛选（render 读取输入框）
 // 与滚动位置（纵向在 window、横向在 .table-wrap）。正在编辑时直接跳过。
-async function refreshAccountsSoft() {
+async function refreshAccountsSoft(requestOptions) {
   if (isEditingAccounts()) return;
   const wrap = visibleTableWrap();
   const winY = window.scrollY, winX = window.scrollX;
   const wrapLeft = wrap ? wrap.scrollLeft : 0, wrapTop = wrap ? wrap.scrollTop : 0;
   try {
-    const data = await api("/api/accounts");
+    const data = await api("/api/accounts", requestOptions);
     accounts = data.accounts || [];
     render();
   } catch (_) { return; } // 轮询期间偶发失败忽略，下一轮再试
@@ -272,6 +345,7 @@ function filtered() {
   const q = el("search").value.trim().toLowerCase();
   const f = el("filterStatus").value;
   const cat = el("filterCategory") ? el("filterCategory").value : "";
+  const cloudPhone = el("filterCloudPhone") ? el("filterCloudPhone").value : "";
   return accounts.filter((a) => {
     if (inNurtureOf(a)) return false;
     if (inScrapOf(a)) return false;
@@ -282,6 +356,7 @@ function filtered() {
     if (f === "abnormal" && !isAbnormal(a)) return false;
     if (f === "unchecked" && !isUnchecked(a)) return false;
     if (cat && catOf(a) !== cat) return false;
+    if (cloudPhone && cloudPhoneStateOf(a) !== cloudPhone) return false;
     if (!q) return true;
     // 搜索把货源渠道也纳入，方便按进货来源找号。
     return [a.email, a.country, a.notes, a.language, sourceOf(a)].some((v) => String(v || "").toLowerCase().includes(q));
@@ -391,6 +466,33 @@ function passwordCheckBadge(a) {
   return `<span class="password-check ${cls}" title="${escapeHtml(`${text}${detail}${checkedAt}`)}">${escapeHtml(text)}</span>`;
 }
 
+function totpSetupStateInfo(value) {
+  const states = {
+    added: { text: "已添加", cls: "ok" },
+    pending_activation: { text: "密钥已保存·开启待确认", cls: "warn" },
+    already_configured: { text: "已有验证器", cls: "known" },
+    needs_attention: { text: "设置需处理", cls: "warn" },
+    failed: { text: "添加失败", cls: "bad" },
+  };
+  return Object.hasOwn(states, value) ? states[value] : null;
+}
+
+function totpSetupResultText(result) {
+  if (!result || result.action !== "add-2fa") return "";
+  const check = result.fieldPatch && result.fieldPatch.lastTotpSetup;
+  return totpSetupStateInfo(check && check.state)?.text || "未确认";
+}
+
+function totpSetupBadge(a) {
+  const check = a && a.lastTotpSetup;
+  if (!check || typeof check !== "object") return "";
+  const state = totpSetupStateInfo(check.state);
+  if (!state) return "";
+  const detail = check.detail ? `；${check.detail}` : "";
+  const checkedAt = check.checkedAt ? `；${fmtTime(check.checkedAt)}` : "";
+  return `<span class="totp-setup-result"><span class="totp-setup-badge ${state.cls}" title="${escapeHtml(`身份验证器：${state.text}${detail}${checkedAt}`)}">${state.text}</span></span>`;
+}
+
 // 状态列对应的检测项名称，用于下拉的悬停提示（滚动时即使表头看不见也能分清是哪项）。
 const STATUS_FIELD_LABEL = {
   login: "登录", gmail: "Gmail", youtube: "YouTube", payment: "支付", family: "家庭组",
@@ -471,12 +573,13 @@ function accountRowHtml(a, i) {
         <div class="acc-pass">${editCell(a, "password", a.password, { mono: true })}<button class="ghost slim row-copypass" data-id="${a.id}" title="复制该账号密码">复制密码</button>${passwordCheckBadge(a)}</div>
       </td>
       ${twoStepPhoneCellHtml(a)}
+      ${cloudPhoneCellHtml(a)}
       <td class="cat-cell">${categoryCell(a)}</td>
       <td>${editCell(a, "source", sourceOf(a))}</td>
       <td class="sale-cell">${saleCell(a)}</td>
       <td class="totp-cell${a.status.login === "2fa_error" ? " totp-bad" : ""}">${a.totpSecret
         ? `<button class="ghost slim totp-btn" data-id="${a.id}">取码</button><span class="totp-out" data-id="${a.id}"></span><span class="totp-secret" data-id="${a.id}" title="双击复制完整2FA密钥">${maskSecret(a.totpSecret)}</span>${a.status.login === "2fa_error" ? '<span class="totp-err" title="2FA 密钥错误，Google 拒绝该验证码，请核对密钥">⚠ 密钥错误</span>' : ""}${Number(a.totpChangeCount) > 0 ? `<span class="totp-changed" title="最近更换：${escapeHtml(fmtTime(a.totpChangedAt) || "—")}；旧密钥：${escapeHtml(a.oldTotpSecret ? maskSecret(a.oldTotpSecret) : "无")}">已换 ${Number(a.totpChangeCount)} 次</span>` : ""}`
-        : '<span class="muted">无</span>'}</td>
+        : '<span class="muted" title="本地未保存验证器密钥，不代表 Google 账号未设置验证器">无密钥</span>'}${totpSetupBadge(a)}</td>
       <td>${statusCell(a, "login")}</td>
       <td>${editCell(a, "country", a.country)}</td>
       <td>${editCell(a, "language", a.language)}</td>
@@ -797,12 +900,19 @@ function hasExportWarning(a) {
   return !!exportWarningText(a);
 }
 
+// 原号检测属于独立的观察结果，不把“可填新号”等中性结果当作异常。
+// 只导出固定标签，不复制可能含号码、验证链接或会话信息的原始详情。
+function cloudPhoneExportText(a) {
+  const label = cloudPhoneResultText(a && a.lastCloudPhoneCheck, true);
+  return label ? `原号检测：${label}` : "";
+}
+
 // 单账号导出格式：邮箱----密码----辅助邮箱/空----2FA密钥----年份----国家
-// 异常账号追加具体原因，例如：----人机验证
+// 后缀依次追加异常原因（如有）、原号检测结果（如已检测）。
 function fmtAccount(a) {
   const base = [a.email || "", a.password || "", a.recoveryEmail || "空", a.totpSecret || "", a.year || "", a.country || ""].join("----");
   const warning = exportWarningText(a);
-  return warning ? `${base}----${warning}` : base;
+  return [base, warning, cloudPhoneExportText(a)].filter(Boolean).join("----");
 }
 
 let toastTimer = null;
@@ -1730,6 +1840,12 @@ el("selectAll").addEventListener("change", (e) => {
 
 el("search").addEventListener("input", render);
 el("filterStatus").addEventListener("change", render);
+el("filterCloudPhone").addEventListener("change", () => {
+  // 避免筛出需原号后，批量操作仍带上筛选外的旧勾选。
+  selected.clear();
+  saveSet(LS.accounts, selected);
+  render();
+});
 // 切换「库」筛选时清空勾选：避免在「全部」里全选后切到某个库，旧勾选被带过去、看着像自动选中。
 el("filterCategory").addEventListener("change", () => {
   selected.clear();
@@ -1787,14 +1903,17 @@ el("maxConcurrent").value = localStorage.getItem(LS.max) || "3";
 el("apiKey").addEventListener("input", () => localStorage.setItem(LS.apiKey, el("apiKey").value.trim()));
 el("maxConcurrent").addEventListener("input", () => localStorage.setItem(LS.max, el("maxConcurrent").value));
 
-// 记住开关：随机指纹 / 清空数据
+// 记住批量运行偏好。solve_close 只临时强制关窗，不能覆盖用户原来的普通保留选择。
+let keepOpenPreference = el("keepOpen").checked;
 function loadFlags() {
   let f = {};
   try { f = JSON.parse(localStorage.getItem(LS.flags) || "{}"); } catch (_) { f = {}; }
   if (typeof f.randomFp === "boolean") el("randomFp").checked = f.randomFp;
   if (typeof f.clearData === "boolean") el("clearData").checked = f.clearData;
   if (typeof f.keepOpen === "boolean") el("keepOpen").checked = f.keepOpen;
-  if (f.manualChallengePolicy === "close" || f.manualChallengePolicy === "keep") {
+  if (typeof f.background === "boolean") el("backgroundRun").checked = f.background;
+  keepOpenPreference = el("keepOpen").checked;
+  if (["close", "keep", "solve_close"].includes(f.manualChallengePolicy)) {
     el("manualChallengePolicy").value = f.manualChallengePolicy;
   }
 }
@@ -1802,15 +1921,169 @@ function saveFlags() {
   localStorage.setItem(LS.flags, JSON.stringify({
     randomFp: el("randomFp").checked,
     clearData: el("clearData").checked,
-    keepOpen: el("keepOpen").checked,
+    keepOpen: keepOpenPreference,
+    background: el("backgroundRun").checked,
     manualChallengePolicy: el("manualChallengePolicy").value,
   }));
 }
 el("randomFp").addEventListener("change", saveFlags);
 el("clearData").addEventListener("change", saveFlags);
-el("keepOpen").addEventListener("change", saveFlags);
-el("manualChallengePolicy").addEventListener("change", saveFlags);
+el("backgroundRun").addEventListener("change", saveFlags);
+el("keepOpen").addEventListener("change", () => {
+  if (el("manualChallengePolicy").value !== "solve_close") keepOpenPreference = el("keepOpen").checked;
+  saveFlags();
+});
+el("manualChallengePolicy").addEventListener("change", () => {
+  saveFlags();
+  syncCapsolverVisibility();
+});
 loadFlags();
+
+// ---- CAPSOLVER：密钥只存本机服务端；浏览器只保存开关和每账号尝试次数 ----
+const CAPSOLVER_PREFERENCES_KEY = "am_capsolver_preferences";
+let capsolverConfigured = false;
+let capsolverSettingsLoaded = false;
+let capsolverSettingsBusy = false;
+let capsolverSettingsRevision = 0;
+let capsolverEnabledPreference = false;
+function solveAndCloseSelected() {
+  return el("manualChallengePolicy").value === "solve_close";
+}
+function syncCapsolverVisibility() {
+  const forcedByPolicy = solveAndCloseSelected();
+  // 自动打码策略强制启用 solver、强制普通结果不保留；退出后恢复进入前的用户偏好。
+  el("capsolverEnabled").checked = forcedByPolicy || capsolverEnabledPreference;
+  el("keepOpen").checked = forcedByPolicy ? false : keepOpenPreference;
+  const enabled = el("capsolverEnabled").checked;
+  const busy = capsolverSettingsBusy || jobStarting;
+  // 保存配置和启用付费服务是独立操作，关闭时仍可保存、更换或清除密钥。
+  el("capsolverEnabled").disabled = forcedByPolicy || jobStarting;
+  el("manualChallengePolicy").disabled = jobStarting;
+  el("keepOpen").disabled = forcedByPolicy || jobStarting;
+  el("backgroundRun").disabled = jobStarting;
+  el("capsolverKey").disabled = busy;
+  el("capsolverMaxTasks").disabled = !enabled || jobStarting;
+  el("capsolverSaveBtn").disabled = busy || !el("capsolverKey").value.trim();
+  el("capsolverSaveBtn").textContent = capsolverConfigured ? "更换" : "保存";
+  el("capsolverClearBtn").disabled = busy || (capsolverSettingsLoaded && !capsolverConfigured);
+  el("capsolverKey").placeholder = capsolverConfigured ? "已保存；留空沿用，输入可更换" : "输入后保存到本机";
+}
+function saveCapsolverPreferences() {
+  const maxAttemptsPerAccount = Number(el("capsolverMaxTasks").value);
+  try {
+    localStorage.setItem(CAPSOLVER_PREFERENCES_KEY, JSON.stringify({
+      enabled: capsolverEnabledPreference,
+      maxAttemptsPerAccount: Number.isInteger(maxAttemptsPerAccount) && maxAttemptsPerAccount >= 1 && maxAttemptsPerAccount <= 10
+        ? maxAttemptsPerAccount : 3,
+    }));
+  } catch (_) { /* 浏览器禁止存储时，本页仍可继续使用。 */ }
+}
+function loadCapsolverPreferences() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(CAPSOLVER_PREFERENCES_KEY) || "{}") || {}; } catch (_) { /* ignore */ }
+  capsolverEnabledPreference = saved.enabled === true;
+  el("capsolverKey").value = "";
+  // 旧 maxTasks 表示整批额度，不能直接作为单个账号的重试次数。
+  el("capsolverMaxTasks").value = Number.isInteger(saved.maxAttemptsPerAccount) && saved.maxAttemptsPerAccount >= 1 && saved.maxAttemptsPerAccount <= 10
+    ? String(saved.maxAttemptsPerAccount) : "3";
+  syncCapsolverVisibility();
+}
+async function loadCapsolverSettings() {
+  if (capsolverSettingsBusy) return;
+  const revision = ++capsolverSettingsRevision;
+  el("capsolverKeyStatus").textContent = "读取配置中…";
+  try {
+    const data = await api("/api/settings/capsolver");
+    if (revision !== capsolverSettingsRevision) return;
+    if (typeof data.configured !== "boolean") throw new Error("invalid settings response");
+    capsolverConfigured = data.configured;
+    capsolverSettingsLoaded = true;
+    el("capsolverKeyStatus").textContent = capsolverConfigured ? "已保存到本机" : "未配置";
+  } catch (_) {
+    if (revision !== capsolverSettingsRevision) return;
+    capsolverConfigured = false;
+    capsolverSettingsLoaded = false;
+    el("capsolverKeyStatus").textContent = "读取失败，请刷新重试或重新保存";
+  } finally {
+    if (revision === capsolverSettingsRevision) syncCapsolverVisibility();
+  }
+}
+async function saveCapsolverKey() {
+  if (capsolverSettingsBusy) throw new Error("CAPSOLVER 配置正在保存，请稍候");
+  const apiKey = el("capsolverKey").value.trim();
+  if (!apiKey) throw new Error("请输入 CAPSOLVER API Key");
+  capsolverSettingsBusy = true;
+  capsolverSettingsRevision += 1;
+  syncCapsolverVisibility();
+  el("capsolverKeyStatus").textContent = "保存中…";
+  try {
+    const data = await api("/api/settings/capsolver", {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ apiKey }),
+    });
+    if (data.configured !== true) throw new Error("invalid settings response");
+    capsolverConfigured = true;
+    capsolverSettingsLoaded = true;
+    if (el("capsolverKey").value.trim() === apiKey) el("capsolverKey").value = "";
+    el("capsolverKeyStatus").textContent = "已保存到本机";
+  } catch (_) {
+    el("capsolverKeyStatus").textContent = "保存失败，请重试";
+    throw new Error("CAPSOLVER 密钥保存失败，请重试");
+  } finally {
+    capsolverSettingsBusy = false;
+    syncCapsolverVisibility();
+  }
+}
+async function clearCapsolverKey() {
+  if (capsolverSettingsBusy || jobStarting) return;
+  capsolverSettingsBusy = true;
+  capsolverSettingsRevision += 1;
+  syncCapsolverVisibility();
+  el("capsolverKeyStatus").textContent = "清除中…";
+  try {
+    const data = await api("/api/settings/capsolver", { method: "DELETE" });
+    if (data.configured !== false) throw new Error("invalid settings response");
+    capsolverConfigured = false;
+    capsolverSettingsLoaded = true;
+    el("capsolverKey").value = "";
+    el("capsolverKeyStatus").textContent = "未配置";
+  } catch (_) {
+    el("capsolverKeyStatus").textContent = "清除失败，请重试";
+  } finally {
+    capsolverSettingsBusy = false;
+    syncCapsolverVisibility();
+  }
+}
+function readCapsolverForm(actionIds, proxy) {
+  if (!solveAndCloseSelected() && !el("capsolverEnabled").checked) return null;
+  if (capsolverSettingsBusy) throw new Error("CAPSOLVER 配置正在保存，请稍候");
+  if (currentMode() !== "local") throw new Error("CAPSOLVER 测试版仅支持本机浏览器登录");
+  const addAuthenticatorOnly = actionIds.length === 1 && actionIds[0] === "add-2fa";
+  if (actionIds.includes("add-2fa") && !addAuthenticatorOnly) {
+    throw new Error("“添加身份验证器”须单独运行，不能与其他操作同时勾选");
+  }
+  if (!addAuthenticatorOnly && (!actionIds.length || actionIds[0] !== "login")) {
+    throw new Error("CAPSOLVER 需要先勾选“登录账号”，或单独选择“添加身份验证器”；不会自动添加操作");
+  }
+  if (actionIds.includes("check-password")) throw new Error("CAPSOLVER 不支持“仅验证账号密码”操作");
+  if (proxy && proxy.enabled) throw new Error("CAPSOLVER 暂不支持代理，请关闭动态住宅代理");
+  if (!capsolverConfigured && !el("capsolverKey").value.trim()) throw new Error("请先输入并保存 CAPSOLVER API Key");
+  const maxAttemptsPerAccount = Number(el("capsolverMaxTasks").value);
+  if (!Number.isInteger(maxAttemptsPerAccount) || maxAttemptsPerAccount < 1 || maxAttemptsPerAccount > 10) {
+    throw new Error("CAPSOLVER 每账号最多打码次数须为 1–10 的整数（含首次）");
+  }
+  return { enabled: true, maxAttemptsPerAccount };
+}
+el("capsolverEnabled").addEventListener("change", () => {
+  if (!solveAndCloseSelected()) capsolverEnabledPreference = el("capsolverEnabled").checked;
+  syncCapsolverVisibility();
+  saveCapsolverPreferences();
+});
+el("capsolverMaxTasks").addEventListener("change", saveCapsolverPreferences);
+el("capsolverKey").addEventListener("input", syncCapsolverVisibility);
+el("capsolverSaveBtn").addEventListener("click", () => saveCapsolverKey().catch(() => {}));
+el("capsolverClearBtn").addEventListener("click", clearCapsolverKey);
+window.addEventListener("pageshow", (event) => { if (event.persisted) return loadCapsolverSettings(); });
+loadCapsolverPreferences();
 
 // ---- 运行模式：调用 AdsPower / 不调用 AdsPower（本机临时浏览器）----
 function currentMode() {
@@ -1984,6 +2257,7 @@ async function loadActions() {
         <span>${escapeHtml(a.label)}</span>
         <span class="risk risk-${a.risk}">${a.risk === "low" ? "低风险" : a.risk === "medium" ? "中风险" : "高风险"}</span>
       </label>`).join("");
+    syncCloudPhoneOptions();
   } catch (err) {
     el("actionList").innerHTML = `<span class="muted">加载操作失败：${escapeHtml(err.message)}</span>`;
   }
@@ -2001,6 +2275,7 @@ el("actionList").addEventListener("change", (e) => {
   }
   const ids = [...document.querySelectorAll('#actionList input:checked')].map((c) => c.value);
   saveSet(actionsKeyFor(currentView), new Set(ids));
+  syncCloudPhoneOptions();
 });
 
 // 发起任务的公共逻辑：批量「对选中账号运行」(#runBtn，传 [...selected]) 与单行「检测/单独运行」
@@ -2012,23 +2287,40 @@ async function startJob(ids) {
     return;
   }
   // 并发约束：已有任务在运行（jobId 存在或正在轮询）时不重复发起，避免两个任务互相打架。
-  if (jobStarting || jobId || jobPolling) {
+  if (jobStarting || jobId || cancelInFlight) {
     toast("已有任务在运行，请先停止或等待完成");
     el("runStatus").textContent = "已有任务在运行，请先停止或等待完成";
     return;
   }
   const mode = currentMode();
   const local = mode === "local";
+  // 启动可能先等待密钥保存；先快照策略、保留与后台开关，避免等待期间 UI 变化造成请求字段互相矛盾。
+  const manualChallengePolicy = el("manualChallengePolicy").value;
+  const solveAndClose = manualChallengePolicy === "solve_close";
+  const keepOpen = solveAndClose ? false : el("keepOpen").checked;
+  const background = el("backgroundRun").checked;
   const accountIds = [...ids];
   const actionIds = [...document.querySelectorAll('#actionList input:checked')].map((c) => c.value);
   const envSerials = [...envSelected];
   if (!local && !envSerials.length) { el("runStatus").textContent = "请先加载并勾选至少一个窗口"; return; }
   if (!accountIds.length) { el("runStatus").textContent = "请先在账号库勾选账号"; return; }
   if (!actionIds.length) { el("runStatus").textContent = "请选择至少一个操作"; return; }
+  const proxy = local ? null : readProxyForm();
+  let captchaSolver;
+  try {
+    captchaSolver = readCapsolverForm(actionIds, proxy);
+  } catch (err) {
+    el("runStatus").textContent = err.message;
+    return;
+  }
   jobStarting = true;
   syncRunButton();
+  syncCapsolverVisibility();
   el("runStatus").textContent = "启动中…";
   try {
+    // 新输入先保存到本机，后续批次由服务端复用；运行请求不携带 CAPSOLVER 密钥。
+    if (captchaSolver && el("capsolverKey").value.trim()) await saveCapsolverKey();
+    saveCapsolverPreferences();
     const data = await api("/api/automation/run", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -2038,15 +2330,26 @@ async function startJob(ids) {
         maxConcurrent: Number(el("maxConcurrent").value) || 3,
         randomFp: el("randomFp").checked,
         clearData: el("clearData").checked,
-        keepOpen: el("keepOpen").checked,
-        manualChallengePolicy: el("manualChallengePolicy").value,
+        background,
+        keepOpen,
+        manualChallengePolicy,
+        captchaSolver,
         phoneMode: readPhoneRunMode(),
+        targets: actionIds.includes("detect-cloud-phone")
+          ? { cloudPhone: { acceptTerms: el("cloudPhoneAcceptTerms").checked } } : {},
         // 本机模式代理仍在规划中：不传 AdsPower 代理池配置（后端会忽略）。
-        proxy: local ? null : readProxyForm(),
+        proxy,
         accountIds, actionIds,
       }),
     });
     jobId = data.jobId;
+    closeTargetId = jobId;
+    trackedJob = data.job || null;
+    cancelIntent = false;
+    cancelError = "";
+    jobPollError = "";
+    jobStateEpoch += 1;
+    persistJobHandles();
     jobManualExpand.clear(); // 新任务：清掉上一批的手动展开/折叠记录，按默认规则重新折叠
     // 单行“检测”就是为了马上看这个账号的结果：无论成功/失败，任务卡默认展开。
     if (accountIds.length === 1) {
@@ -2058,28 +2361,19 @@ async function startJob(ids) {
     renderJob(data.job);
     pollJob();
   } catch (err) {
-    el("runStatus").textContent = err.message;
+    // 付费配置错误可能来自第三方；不把可能包含密钥的原始文本输出到界面。
+    el("runStatus").textContent = captchaSolver
+      ? "启动失败，请检查 CAPSOLVER 配置或稍后重试" : err.message;
   } finally {
     jobStarting = false;
     syncRunButton();
+    syncCapsolverVisibility();
   }
 }
 
 el("runBtn").addEventListener("click", () => startJob([...selected]));
 
-el("stopBtn").addEventListener("click", async () => {
-  if (!jobId) return;
-  el("stopBtn").disabled = true;
-  el("runStatus").textContent = "正在停止并关闭窗口…";
-  try {
-    const data = await api(`/api/automation/jobs/${jobId}/cancel`, { method: "POST" });
-    renderJob(data.job);
-    el("runStatus").textContent = "已停止，正在收尾关闭窗口";
-  } catch (err) {
-    el("runStatus").textContent = err.message;
-    el("stopBtn").disabled = false;
-  }
-});
+el("stopBtn").addEventListener("click", stopCurrentJob);
 
 // 「需人工」判定里要扫描的 detail 关键词（多见于移除设备被风控拦下）。
 const ATTENTION_DETAIL_KEYWORDS = ["拒绝验证", "确认是你本人", "安全码", "无法验证身份", "未通过"];
@@ -2089,8 +2383,10 @@ const JOB_ACTION_TEXT = {
   "detect-ban": "Gmail/YouTube",
   "detect-restrict": "服务限制",
   "detect-region": "账号归属地",
+  "detect-cloud-phone": "原号检测",
   "detect-gpt": "GPT 授权",
   "change-language": "更改语言",
+  "add-2fa": "添加身份验证器",
   "change-2fa": "更改 2FA",
   "remove-devices": "移除设备",
   "remove-phones": "移除验证电话",
@@ -2105,6 +2401,31 @@ const JOB_OUTCOME_TEXT = {
   skipped: "已跳过", rejected: "拒绝验证", seckey: "需要安全代码",
 };
 const JOB_STATUS_TEXT = { queued: "排队中", running: "检测中", done: "已完成", error: "失败", cancelled: "已停止" };
+
+function captchaProgressHtml(captcha) {
+  const labels = {
+    inspecting: "检查挑战", solving: "解题中", processing: "处理中", ready: "结果就绪",
+    submitted: "已提交", accepted: "已通过", failed: "未完成", retrying: "准备重试",
+    checking: "检查复选框", clicked: "已点击一次，等待结果",
+    checkbox_passed: "复选框已通过，确认下一步", challenge: "出现挑战，准备打码",
+    direct_passed: "直接通过 · 未调用打码",
+  };
+  if (!captcha || !Object.prototype.hasOwnProperty.call(labels, captcha.state)) return "";
+  const callbackLabels = { explicit: "显式", observed: "程序注册", none: "未发现" };
+  // 诊断只由枚举和严格布尔值生成固定文字，不拼接回调名、挑战参数或原始响应。
+  const diagnostic = Object.prototype.hasOwnProperty.call(callbackLabels, captcha.callbackSource)
+    ? `回调：${callbackLabels[captcha.callbackSource]}；${captcha.callbackInvoked === true ? "已调用" : "未调用"}`
+      + (typeof captcha.hasDataS === "boolean" ? `；data-s：${captcha.hasDataS ? "有" : "无"}` : "")
+    : "";
+  const prefix = ["checking", "clicked", "checkbox_passed", "challenge", "direct_passed"].includes(captcha.state)
+    ? "人机验证" : "CAPSOLVER";
+  const hasAttempts = Number.isInteger(captcha.attempted) && captcha.attempted >= 0
+    && Number.isInteger(captcha.maxAttemptsPerAccount) && captcha.maxAttemptsPerAccount >= 1
+    && captcha.maxAttemptsPerAccount <= 10 && captcha.attempted <= captcha.maxAttemptsPerAccount;
+  const attempts = hasAttempts && captcha.attempted > 0
+    ? ` · 本账号已调用 ${captcha.attempted}/${captcha.maxAttemptsPerAccount} 次` : "";
+  return `<span class="job-captcha"${diagnostic ? ` title="${diagnostic}"` : ""}>${prefix} · ${labels[captcha.state]}${attempts}</span>`;
+}
 
 // 判定一个账号 task 是否「异常/需人工」。用于顶部汇总、「只看异常」筛选与默认展开。
 // 满足以下任一条件即算需人工：
@@ -2145,26 +2466,32 @@ function renderJob(job) {
   // 交互全部走 #jobBoard 上的事件委托，所以重渲染不会丢绑定；筛选/折叠态从持久化与内存还原。
   const toolbar = `<div class="job-toolbar">
     <div class="job-summary">共 <b>${total}</b> 个 · 已完成 <b>${doneCount}</b> · <span class="job-summary-attn">需人工/异常 <b>${attnCount}</b></span></div>
+    ${job.background === true ? '<span class="badge" title="本批启用最小化运行，可从任务栏手动恢复；窗口保留策略不变">后台运行（最小化）</span>' : ""}
     <label class="switch job-filter"><input type="checkbox" id="jobOnlyAbnormal"${onlyAbnormal ? " checked" : ""} /><span>只看异常</span></label>
     <button type="button" class="ghost slim job-clear-btn">清空日志</button>
   </div>`;
 
   const cards = tasks.map((t) => {
     const needs = taskNeedsAttention(t);
-    if (onlyAbnormal && !needs) return ""; // 只看异常：隐藏全绿正常号
+    if (onlyAbnormal && !needs && !t.windowWarning) return ""; // 隐藏正常号，但窗口警告始终可见，不改变账号检测结果。
     // 折叠态：用户手动 toggle 过的以记录为准；否则需人工默认展开、正常默认折叠。
     const expanded = jobManualExpand.has(t.email) ? jobManualExpand.get(t.email) : needs;
     // 逐条动作结果 + 人话提示（detail），换 2FA 等关键写操作的成功/失败一眼可见。
     const lines = (t.results || []).map((r) => {
       const msg = r.detail ? Object.values(r.detail).filter(Boolean).join("；") : "";
-      const mark = r.outcome === "ok" ? "✓" : (r.outcome === "error" ? "✗" : "•");
+      const cloudPhoneCheck = r.action === "detect-cloud-phone" && r.fieldPatch && r.fieldPatch.lastCloudPhoneCheck;
+      const cloudPhoneState = cloudPhoneCheck && cloudPhoneCheck.state;
+      const isShellResult = cloudPhoneState === "unknown" && ["no_challenge", "cloud_unavailable", "cloud_disabled", "cloud_authorization_required"].includes(cloudPhoneCheck.reasonCode);
+      const cloudPhoneText = cloudPhoneResultText(cloudPhoneCheck, isShellResult);
+      const neutralCloudResult = cloudPhoneState === "unknown" && r.outcome === "ok";
+      const mark = neutralCloudResult ? "•" : (r.outcome === "ok" ? "✓" : (r.outcome === "error" ? "✗" : "•"));
       const actionText = JOB_ACTION_TEXT[r.action] || r.action;
-      const outcomeText = r.action === "check-password"
+      const outcomeText = totpSetupResultText(r) || cloudPhoneText || (r.action === "check-password"
         ? (passwordCheckResultText(r) || JOB_OUTCOME_TEXT[r.outcome] || r.outcome)
         : r.action === "login" && r.reasonCode
           ? (loginCheckResultText(r) || JOB_OUTCOME_TEXT[r.outcome] || r.outcome)
-        : (JOB_OUTCOME_TEXT[r.outcome] || r.outcome);
-      return `<div class="job-line out-${escapeHtml(r.outcome)}">${mark} ${escapeHtml(actionText)}：${escapeHtml(outcomeText)}${msg ? " — " + escapeHtml(msg) : ""}</div>`;
+        : (JOB_OUTCOME_TEXT[r.outcome] || r.outcome));
+      return `<div class="job-line out-${neutralCloudResult ? "neutral" : escapeHtml(r.outcome)}">${mark} ${escapeHtml(actionText)}：${escapeHtml(outcomeText)}${msg ? " — " + escapeHtml(msg) : ""}</div>`;
     }).join("");
     const head = t.error ? `错误：${t.error}` : (JOB_STATUS_TEXT[t.status] || t.status);
     return `<div class="job-task ${t.status}${needs ? " needs-attn" : ""}${expanded ? "" : " folded"}" data-email="${escapeHtml(t.email)}">
@@ -2173,13 +2500,15 @@ function renderJob(job) {
         <span class="job-email">${escapeHtml(t.email)}</span>
         <span class="job-env">${t.env ? `环境 ${t.env}` : "待分配"}</span>
         <span class="job-status">${escapeHtml(head)}</span>
+        ${captchaProgressHtml(t.captcha)}
         ${needs ? `<span class="job-attn">需人工</span>` : ""}
       </div>
+      ${t.windowWarning ? `<div class="job-window-warning">${escapeHtml(t.windowWarning)}</div>` : ""}
       <div class="job-lines">${lines}</div>
     </div>`;
   }).join("");
 
-  const emptyHint = (onlyAbnormal && attnCount === 0 && total > 0)
+  const emptyHint = (onlyAbnormal && !cards && total > 0)
     ? `<div class="job-empty-hint">没有需人工的账号（关闭「只看异常」查看全部）</div>` : "";
 
   el("jobBoard").innerHTML = toolbar + emptyHint + cards;
@@ -2213,9 +2542,163 @@ el("jobBoard").addEventListener("change", (e) => {
   }
 });
 
+function jobHasOpenWindows(job) {
+  return !!job && (job.envs || []).some((env) => env && (env.busy || env.retained));
+}
+
+function jobCloseErrors(job) {
+  return job && Array.isArray(job.closeErrors) ? job.closeErrors : [];
+}
+
+function jobIsSettled(job) {
+  return !!job && ["done", "cancelled", "error"].includes(job.status) && !job.closing
+    && !(job.envs || []).some((env) => env && env.busy)
+    && !(job.tasks || []).some((task) => task && ["queued", "running"].includes(task.status));
+}
+
+function persistJobHandles() {
+  try {
+    if (jobId) localStorage.setItem(LS.job, jobId); else localStorage.removeItem(LS.job);
+    if (closeTargetId) localStorage.setItem(LS.closeJob, closeTargetId); else localStorage.removeItem(LS.closeJob);
+    if (cancelIntent && closeTargetId) localStorage.setItem(LS.cancelJob, closeTargetId); else localStorage.removeItem(LS.cancelJob);
+  } catch (_) { /* 浏览器禁用存储时，本页仍保留关闭目标。 */ }
+}
+
+function syncStopButton() {
+  const button = el("stopBtn");
+  button.disabled = !closeTargetId || cancelInFlight;
+  button.textContent = cancelInFlight ? "正在请求停止…"
+    : cancelError || jobPollError || jobCloseErrors(trackedJob).length ? "重试停止并关闭"
+      : trackedJob && (trackedJob.closing || trackedJob.cancelRequested) ? "重试关闭窗口"
+        : trackedJob && jobIsSettled(trackedJob) && jobHasOpenWindows(trackedJob) ? "关闭保留窗口"
+          : "停止并关闭窗口";
+  button.title = "仅处理当前或最后显示任务所属窗口，不关闭其它历史任务窗口";
+}
+
+function syncJobStatusText() {
+  const job = trackedJob;
+  const errors = jobCloseErrors(job);
+  let text = "";
+  if (cancelInFlight) text = "正在请求停止并关闭窗口…";
+  else if (jobPollError) text = `无法确认任务/窗口状态：${jobPollError}；可点击重试`;
+  else if (cancelError) text = `停止请求未确认：${cancelError}；可点击重试`;
+  else if (errors.length) text = `窗口关闭失败：${errors.map((item) => `${item.env || "窗口"}：${item.message || "关闭未确认"}`).join("；")}；请重试关闭`;
+  else if (job && (job.closing || (job.cancelRequested && !jobIsSettled(job)))) text = "正在停止并关闭窗口，等待关闭结果…";
+  else if (job && jobIsSettled(job) && jobHasOpenWindows(job)) text = `${completedJobText(job)}；窗口仍保留，可点击“关闭保留窗口”`;
+  else if (job && jobIsSettled(job)) text = cancelIntent || job.cancelRequested || job.status === "cancelled"
+    ? "已停止并关闭窗口" : completedJobText(job);
+  else if (cancelIntent) text = "停止请求尚未确认，请点击重试；窗口未确认关闭";
+  else if (job) text = "任务执行中，正在实时刷新…";
+  if (text) el("runStatus").textContent = text;
+  syncRunButton();
+}
+
+// 超时包括读取响应体；失败不等于请求未送达，保留目标并允许重试。
+async function requestJobState(target, method = "GET", timeoutMs = 12000) {
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error("请求超时"));
+      controller.abort();
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([timeout, (async () => {
+      const suffix = method === "POST" ? "/cancel" : "";
+      const response = await fetch(`/api/automation/jobs/${encodeURIComponent(target)}${suffix}`, { method, signal: controller.signal });
+      const data = await response.json();
+      if (!response.ok) {
+        const error = new Error(data.error || `请求失败（${response.status}）`);
+        error.status = response.status;
+        throw error;
+      }
+      if (!data.job || data.job.id !== target || !Array.isArray(data.job.envs) || !Array.isArray(data.job.tasks)
+          || !["queued", "running", "done", "cancelled", "error"].includes(data.job.status)) {
+        throw new Error("任务响应不完整，关闭结果未确认");
+      }
+      return data.job;
+    })()]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function acceptJobSnapshot(job, target, epoch) {
+  if (closeTargetId !== target || epoch !== jobStateEpoch) return false;
+  trackedJob = job;
+  jobPollError = "";
+  if (job.cancelRequested) { cancelIntent = true; cancelError = ""; }
+  renderJob(job);
+  if (jobIsSettled(job)) {
+    jobId = null;
+    if (!jobHasOpenWindows(job) && !jobCloseErrors(job).length) {
+      closeTargetId = null;
+      cancelError = "";
+    }
+  } else {
+    jobId = target;
+  }
+  persistJobHandles();
+  syncJobStatusText();
+  return true;
+}
+
+function noteJobReadFailure(error, target, epoch) {
+  if (closeTargetId !== target || epoch !== jobStateEpoch) return;
+  jobPollError = error.status === 404 ? "服务端任务记录不存在，不能据此确认窗口已关闭" : (error.message || "连接异常");
+  // 服务端重启后旧任务无法继续轮询，但关闭入口和未知状态不能冒充成功清掉。
+  if (error.status === 404) { jobId = null; trackedJob = null; }
+  persistJobHandles();
+  syncJobStatusText();
+}
+
+async function stopCurrentJob() {
+  const target = closeTargetId || jobId;
+  if (!target || cancelInFlight) return;
+  closeTargetId = target;
+  jobId = target;
+  cancelInFlight = true;
+  cancelIntent = true;
+  cancelError = "";
+  jobPollError = "";
+  const epoch = ++jobStateEpoch; // 丢弃取消前发出的旧 GET，防止覆盖正在关闭状态。
+  persistJobHandles();
+  syncJobStatusText();
+  try {
+    const job = await requestJobState(target, "POST");
+    if (closeTargetId === target && epoch === jobStateEpoch) acceptJobSnapshot(job, target, ++jobStateEpoch);
+  } catch (err) {
+    if (closeTargetId === target && epoch === jobStateEpoch) {
+      cancelError = err.message || "连接异常";
+      if (err.status === 404) noteJobReadFailure(err, target, epoch);
+    }
+  } finally {
+    cancelInFlight = false;
+    syncJobStatusText();
+    if (closeTargetId === target) pollJob();
+  }
+}
+
+// 账号/手机号表刷新独立于状态轮询，不让慢请求卡住“停止并关闭”的反馈。
+function refreshJobAccountData(job) {
+  if (jobRefreshRunning) return;
+  jobRefreshRunning = true;
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => { controller.abort(); resolve(); }, 10000);
+  });
+  Promise.race([timeout, (async () => {
+    await refreshAccountsSoft({ signal: controller.signal });
+    if (controller.signal.aborted) return;
+    if ((job.actionIds || []).includes("add-2fa-phone")) await loadPhones({ skipIfEditing: true, signal: controller.signal });
+  })()]).catch(() => {}).finally(() => { clearTimeout(timer); jobRefreshRunning = false; });
+}
+
 function clearJob() {
   jobId = null;
-  try { localStorage.removeItem(LS.job); } catch (_) { /* ignore */ }
+  persistJobHandles();
   syncRunButton();
 }
 
@@ -2224,6 +2707,8 @@ function completedJobText(job) {
   if (job && job.status === "cancelled") return "已停止";
   if (tasks.length === 1) {
     const task = tasks[0];
+    const setupResult = (task.results || []).find((r) => r && r.action === "add-2fa");
+    if (setupResult) return `检测完成：${task.email} · 身份验证器：${totpSetupResultText(setupResult)}`;
     const credentialResult = (task.results || []).find((r) => r && (r.action === "login" || r.action === "check-password"));
     if (credentialResult) {
       const reason = credentialResult.action === "check-password"
@@ -2242,60 +2727,59 @@ function completedJobText(job) {
 }
 
 async function pollJob() {
-  if (jobPolling || !jobId) return;
+  const target = jobId || closeTargetId;
+  if (!target || (jobPolling && jobPollTarget === target)) return;
   jobPolling = true;
+  jobPollTarget = target;
   syncRunButton();
-  try { localStorage.setItem(LS.job, jobId); } catch (_) { /* ignore */ }
-  while (jobId) {
-    const res = await fetch(`/api/automation/jobs/${jobId}`).catch(() => null);
-    if (res && res.ok) {
-      const { job } = await res.json();
-      renderJob(job);
-      // 实时刷新账号库：引擎每完成一个动作就已写回库，这里逐轮拉取即可让
-      // “每个账号一完成就显示最新检测状态”，无需等整个 job 跑完。
-      await refreshAccountsSoft();
-      // 添加手机号每个账号独立经历 reserved → pending → used/failed；同步刷新池便于查看并发数量
-      // 就能看到号码已经被哪个账号领取、是否已确认生效或仍需人工处理。
-      if ((job.actionIds || []).includes("add-2fa-phone")) await loadPhones({ skipIfEditing: true });
-      if (job.status === "done" || job.status === "cancelled") {
-        el("stopBtn").disabled = true;
-        el("runStatus").textContent = completedJobText(job);
-        clearJob(); // 进入终态：清掉 jobId 让 while 退出，轮询自动停止，不再空转
-        break;
+  persistJobHandles();
+  try {
+    while (closeTargetId === target) {
+      const epoch = jobStateEpoch;
+      try {
+        const job = await requestJobState(target);
+        if (acceptJobSnapshot(job, target, epoch)) {
+          refreshJobAccountData(job);
+          if (jobIsSettled(job)) break;
+        }
+      } catch (err) {
+        noteJobReadFailure(err, target, epoch);
+        if (err.status === 404) break;
       }
-    } else if (res && res.status === 404) {
-      // job 已不存在（如服务重启丢失内存态）：停止轮询，避免无意义空转。
-      clearJob();
-      break;
+      if (closeTargetId !== target) break;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
-    await new Promise((r) => setTimeout(r, 2000));
+  } finally {
+    if (jobPollTarget === target) {
+      jobPolling = false;
+      jobPollTarget = null;
+    }
+    syncRunButton();
   }
-  jobPolling = false;
-  syncRunButton();
 }
 
-// 页面刷新/重新进入时，若存在仍在运行的 job 则恢复实时轮询；否则清掉记录。
+// 页面刷新后既恢复运行中的任务，也恢复最后任务的保留窗口；请求失败不能遗失关闭目标。
 async function resumeJobIfAny() {
-  let saved = "";
-  try { saved = localStorage.getItem(LS.job) || ""; } catch (_) { saved = ""; }
+  let saved = "", active = "", requested = "";
+  try {
+    active = localStorage.getItem(LS.job) || "";
+    saved = active || localStorage.getItem(LS.closeJob) || "";
+    requested = localStorage.getItem(LS.cancelJob) || "";
+  } catch (_) { /* ignore */ }
   if (!saved) return;
-  jobId = saved;
+  jobId = active || null;
+  closeTargetId = saved;
+  cancelIntent = requested === saved;
+  const epoch = ++jobStateEpoch;
+  persistJobHandles();
   syncRunButton();
   try {
-    const res = await fetch(`/api/automation/jobs/${saved}`);
-    if (!res.ok) { clearJob(); return; }
-    const { job } = await res.json();
-    renderJob(job);
-    if (job.status === "running") {
-      el("stopBtn").disabled = false;
-      el("runStatus").textContent = "检测到运行中的任务，已恢复实时刷新";
-      pollJob();
-    } else {
-      clearJob(); // 已是终态：不需要轮询了
-    }
-  } catch (_) {
-    clearJob();
+    const job = await requestJobState(saved);
+    acceptJobSnapshot(job, saved, epoch);
+  } catch (err) {
+    noteJobReadFailure(err, saved, epoch);
   }
+  if (jobId === saved) pollJob();
 }
 
 // ---- 信用卡卡池 ----
@@ -2610,7 +3094,7 @@ function renderPhones() {
 async function loadPhones(options = {}) {
   if (options.skipIfEditing && isEditingPhonePool()) return false;
   try {
-    const data = await api("/api/phones");
+    const data = await api("/api/phones", { signal: options.signal });
     phones = data.phones || [];
     renderPhones();
     return true;
@@ -2792,7 +3276,7 @@ el("phoneRows").addEventListener("click", async (event) => {
   }
 });
 
-Promise.all([loadAccounts(), loadActions()])
+Promise.all([loadAccounts(), loadActions(), loadCapsolverSettings()])
   .then(() => resumeJobIfAny()) // 账号和操作都就绪后，再恢复旧任务并开放首次点击
   .then(() => { appReady = true; })
   .catch((err) => {

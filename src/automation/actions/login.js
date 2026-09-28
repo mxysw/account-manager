@@ -3,7 +3,7 @@
 /**
  * Google 账号自动登录（puppeteer 版）。
  *
- * 流程：打开 Google 登录页 → 填邮箱 → 填密码 → 填 TOTP(2FA) → 跳过 passkey 等插页 → 登录完成。
+ * 流程：打开 Google 登录页 → 填邮箱 → 填密码 → 如页面要求则填写 TOTP 或确认辅助邮箱 → 跳过可选插页 → 登录完成。
  * 安全原则：遇到验证码 / 可疑活动 / “浏览器不安全” / 需要额外身份验证 → 立即停下，
  *           返回 outcome=need_verify（归「待人工」），绝不硬闯。
  *
@@ -15,10 +15,19 @@
 
 const totp = require("../../totp");
 const { syncTime, accurateNow } = require("../time-sync");
+const { classifyRecoveryEmail, submitRecoveryEmail, inspectRecoveryEmailPage, findRecoveryEmailNext, RECOVERY_OPTION_RE } = require("./recovery-email");
+const { handleLoginCaptcha, checkCancelled, hasGoogleRejectionText } = require("../login-captcha");
+const { installRecaptchaObserver } = require("../recaptcha-observer");
+const { classifyLoginPhoneChallenge } = require("../login-phone-challenge");
 
 const LOGIN_URL = "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fmyaccount.google.com%2F";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function diagnosticPageUrl(url) {
+  try { const parsed = new URL(url); return `${parsed.origin}${parsed.pathname}`; }
+  catch (_) { return ""; }
+}
 
 // TOTP 窗口长度（秒），需与 totp.generate 默认 step 一致。
 const TOTP_STEP = 30;
@@ -348,13 +357,18 @@ async function clickText(page, sources) {
       .filter((el) => {
         const rect = el.getBoundingClientRect();
         const style = getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden"
+          && style.pointerEvents !== "none" && !el.closest("[hidden], [inert], [aria-hidden='true']")
+          && !el.disabled && el.getAttribute("aria-disabled") !== "true";
       })
       .map((el) => ({
         el,
         tag: el.tagName,
         role: el.getAttribute("role") || "",
-        text: [el.textContent || "", el.getAttribute("aria-label") || ""].join(" ").replace(/\s+/g, " ").trim(),
+        text: [el.textContent || "", el.getAttribute("aria-label") || ""]
+          .map((label) => label.replace(/\s+/g, " ").trim())
+          .find((label) => regexes.some((rx) => rx.test(label)))
+          || [el.textContent || "", el.getAttribute("aria-label") || ""].join(" ").replace(/\s+/g, " ").trim(),
         area: Math.max(1, el.getBoundingClientRect().width * el.getBoundingClientRect().height),
       }))
       .filter((item) => item.text && regexes.some((rx) => rx.test(item.text)))
@@ -390,12 +404,13 @@ function withTimeout(promise, ms, fallback) {
 
 // 真实 CDP 输入点击：ElementHandle.click() 优先，失败退回 page.mouse 坐标点击。
 // Google 账号页 / 验证方式列表对合成事件常不响应，真实输入更可靠（与 detect-gpt 的 realClick 同约定）。
-async function realClickHandle(page, handle) {
+async function realClickHandle(page, handle, opts = {}) {
   const el = handle && handle.asElement ? handle.asElement() : null;
   if (!el) return false;
   const doClick = (async () => {
     try { await el.evaluate((n) => n.scrollIntoView({ block: "center", inline: "center" })); } catch (_) { /* ignore */ }
     try { await el.click({ delay: 30 }); return true; } catch (_) { /* 退回坐标点击 */ }
+    if (opts.coordinateFallback === false) return false;
     try {
       const box = await el.boundingBox();
       if (box) { await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { delay: 30 }); return true; }
@@ -408,7 +423,7 @@ async function realClickHandle(page, handle) {
 // 按正则在页面里找「最具体」的文本节点，向上提升到真实可点击祖先后用 CDP 真实点击。
 // Google 登录页有时把按钮文字放在 span，外层则是只有 jsaction/tabindex、没有标准 role 的 div；
 // 只搜 button/[role=button] 会看得到文字却拿不到目标。优先最短文本、再取最小面积，避免点到整块大容器。
-async function realClickByText(page, reSrc) {
+async function realClickByText(page, reSrc, opts = {}) {
   let handle = null;
   try {
     handle = await withTimeout(page.evaluateHandle((src) => {
@@ -421,12 +436,13 @@ async function realClickByText(page, reSrc) {
           const s = getComputedStyle(n);
           return r.width > 0 && r.height > 0
             && s.visibility !== "hidden" && s.display !== "none" && s.pointerEvents !== "none"
-            && !n.closest("[hidden], [inert]")
+            && !n.closest("[hidden], [inert], [aria-hidden='true']")
             && n.getAttribute("aria-disabled") !== "true" && !n.disabled;
         })
         .map((n) => {
           const r = n.getBoundingClientRect();
-          const t = [n.textContent || "", n.getAttribute("aria-label") || ""].join(" ").replace(/\s+/g, " ").trim();
+          const labels = [n.textContent || "", n.getAttribute("aria-label") || ""].map((value) => value.replace(/\s+/g, " ").trim());
+          const t = labels.find((value) => re.test(value)) || labels.join(" ").trim();
           return { n, t, area: Math.max(1, r.width * r.height) };
         })
         .filter((o) => o.t && o.t.length < 140 && re.test(o.t))
@@ -434,7 +450,7 @@ async function realClickByText(page, reSrc) {
       if (!cands[0]) return null;
       return cands[0].n.closest(clickableSelector) || cands[0].n;
     }, reSrc), 6000, null);
-    return await realClickHandle(page, handle);
+    return await realClickHandle(page, handle, opts);
   } catch (_) {
     return false;
   } finally {
@@ -464,7 +480,8 @@ async function waitForAuthMethodList(page, totalMs = 3500) {
   let sawSelectionUrl = false;
   while (Date.now() < deadline) {
     if (/\/challenge\/selection(?:[/?#]|$)/i.test(page.url())) sawSelectionUrl = true;
-    if (AUTH_OPTION_RE.test(await bodyText(page))) return true;
+    const text = await bodyText(page);
+    if (AUTH_OPTION_RE.test(text) || await hasRecoveryEmailOption(page)) return true;
     await sleep(250);
   }
   // URL 先切到 selection、DOM 后渲染是 Google SPA 的常见时序。这里至少等完整个窗口，
@@ -504,6 +521,75 @@ async function chooseAuthenticatorMethod(page, transitionMs = 6000) {
   const synthetic = await clickText(page, [AUTH_OPTION_RE.source]);
   if (synthetic && await waitForAuthenticatorTotp(page, transitionMs)) return true;
   return false;
+}
+
+async function hasRecoveryEmailOption(page) {
+  return withTimeout(page.evaluate((source) => {
+    const re = new RegExp(source, "i");
+    return [...document.querySelectorAll("button,a,li,[role='link'],[role='button'],[data-challengetype],span")].some((node) => {
+      const r = node.getBoundingClientRect();
+      const s = getComputedStyle(node);
+      const labels = [node.textContent || "", node.getAttribute("aria-label") || ""].map((value) => value.replace(/\s+/g, " ").trim());
+      return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden"
+        && s.pointerEvents !== "none" && !node.closest("[hidden], [inert], [aria-hidden='true']")
+        && !node.disabled && node.getAttribute("aria-disabled") !== "true" && labels.some((value) => re.test(value));
+    });
+  }, RECOVERY_OPTION_RE.source), 5000, false);
+}
+
+// Selecting a method is not completing authentication. Observe the destination
+// even if the click reports a navigation error; never click stale coordinates.
+async function chooseRecoveryEmailMethod(page, transitionMs = 6000) {
+  let start;
+  try { start = new URL(page.url()); } catch (_) { return false; }
+  if (start.origin !== "https://accounts.google.com"
+    || !/\/challenge\/selection(?:\/|$)/i.test(start.pathname)) return false;
+  const onOriginalSelection = () => {
+    try {
+      const current = new URL(page.url());
+      return current.origin === start.origin && current.pathname === start.pathname;
+    } catch (_) { return false; }
+  };
+  const waitForTransition = async () => {
+    const deadline = Date.now() + Math.max(0, transitionMs);
+    for (let poll = 0; poll < 30; poll += 1) {
+      const snapshot = await observeRecoveryEmail(page);
+      const phase = classifyRecoveryEmail(snapshot.text, snapshot.url, snapshot.signals);
+      if (phase === "confirm" || phase === "code" || !onOriginalSelection()) return true;
+      if (Date.now() >= deadline) break;
+      await sleep(Math.min(250, Math.max(0, deadline - Date.now())));
+    }
+    return false;
+  };
+  await realClickByText(page, RECOVERY_OPTION_RE.source, { coordinateFallback: false });
+  if (await waitForTransition()) return true;
+  // A physical click can be ignored by the SPA. Fall back once, only while the
+  // original choice is still present; confirmation/code forms are never clicked.
+  if (!onOriginalSelection() || !await hasRecoveryEmailOption(page)) return !onOriginalSelection();
+  if (!onOriginalSelection()) return true;
+  await withTimeout(clickText(page, [RECOVERY_OPTION_RE.source]), 5000, false);
+  return waitForTransition();
+}
+
+async function clickRecoveryEmailNext(page) {
+  let handle;
+  try {
+    const snapshot = await observeRecoveryEmail(page);
+    if (classifyRecoveryEmail(snapshot.text, snapshot.url, snapshot.signals) !== "confirm") return false;
+    handle = await withTimeout(page.evaluateHandle(findRecoveryEmailNext, undefined, undefined, snapshot.addressSelector || ""), 6000, null);
+    const button = handle && handle.asElement();
+    if (!button) return false;
+    // Exactly one physical click. A navigation error after dispatch is ambiguous,
+    // so the caller observes the page instead of retrying the submission.
+    await withTimeout(button.click(), 6000, true);
+    return true;
+  } finally { if (handle) await withTimeout(handle.dispose().catch(() => {}), 2000, null); }
+}
+
+async function observeRecoveryEmail(page) {
+  return withTimeout(page.evaluate(inspectRecoveryEmailPage).catch(() => null), 5000, null)
+    .then((snapshot) => snapshot && typeof snapshot === "object" && typeof snapshot.url === "string"
+      ? snapshot : { url: page.url(), text: "", signals: { addressInput: false, codeInput: false } });
 }
 
 async function clickNext(page) {
@@ -613,7 +699,9 @@ const LOGIN_REASON_CODES = new Set([
   "ok", "password_correct",
   "password_wrong", "password_changed", "credentials_missing",
   "totp_missing", "totp_invalid", "totp_flow_error",
-  "captcha", "device_prompt", "sms_verification", "security_code", "no_supported_2fa",
+  "recovery_email_missing", "recovery_email_wrong", "recovery_email_code_required",
+  "captcha", "captcha_detection_failed", "device_prompt", "sms_verification", "security_code", "no_supported_2fa",
+  "phone_add_required", "phone_verification_required", "captcha_phone_add_required", "captcha_phone_verification_required",
   "risk_verification", "browser_blocked", "browser_start_failed",
   "account_disabled", "account_not_found",
   "unknown_challenge", "timeout", "other",
@@ -671,10 +759,12 @@ function tagLogin(r) {
   const reasonCode = inferLoginReasonCode(r);
   const needVerifyCodes = new Set([
     "totp_flow_error", "captcha", "device_prompt", "sms_verification", "security_code",
+    "phone_add_required", "phone_verification_required", "captcha_phone_add_required", "captcha_phone_verification_required",
     "no_supported_2fa", "risk_verification", "browser_blocked", "unknown_challenge",
   ]);
   let s;
   if (r.outcome === "ok") s = "ok";
+  else if (reasonCode === "captcha_detection_failed") s = "unknown";
   else if (reasonCode === "totp_missing" || reasonCode === "totp_invalid") s = "2fa_error";
   else if (r.outcome === "need_verify" || needVerifyCodes.has(reasonCode)) s = "need_verify";
   else s = "failed";
@@ -693,7 +783,9 @@ function tagLogin(r) {
   const supersedesPasswordCheck = r.passwordSubmitted === true && new Set([
     "ok", "password_wrong", "password_changed",
     "totp_invalid", "totp_flow_error", "device_prompt", "sms_verification",
+    "phone_add_required", "phone_verification_required", "captcha_phone_add_required", "captcha_phone_verification_required",
     "security_code", "no_supported_2fa", "unknown_challenge",
+    "recovery_email_missing", "recovery_email_wrong", "recovery_email_code_required",
   ]).has(reasonCode);
   const fieldPatch = { ...(r.fieldPatch || {}), lastLoginCheck };
   if (supersedesPasswordCheck) fieldPatch.lastPasswordCheck = null;
@@ -783,13 +875,18 @@ async function submitPasswordOnce(page, selectors, opts = {}) {
 // 打开登录页的冷启动重试由完整登录与“仅检测密码”共用。返回的新 page 可能替换掉清数据后
 // 已 detached 的旧 page；调用方必须使用返回值继续。
 async function openLoginPage(page, ctx) {
+  checkCancelled(ctx && ctx.signal);
   await sleep(1000);
   const MAX_OPEN_TRIES = 8;
   for (let i = 0; i < MAX_OPEN_TRIES; i += 1) {
+    checkCancelled(ctx && ctx.signal);
     try {
+      if (ctx && ctx.captchaSolver) await installRecaptchaObserver(page);
+      checkCancelled(ctx && ctx.signal);
       await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
       return { page, error: null };
     } catch (err) {
+      checkCancelled(ctx && ctx.signal);
       if (i === MAX_OPEN_TRIES - 1) return { page, error: err };
       const dead = /detached|Target closed|Session closed|frame got detached|Navigating frame was detached/i.test(err.message);
       if (dead && ctx && ctx.browser) {
@@ -906,23 +1003,22 @@ async function login(page, account, ctx) {
   if (!account.email || !account.password) {
     return tagLogin({ outcome: "error", reasonCode: "credentials_missing", detail: { login: "缺少邮箱或密码" } });
   }
-  if (!account.totpSecret) {
-    return tagLogin({ outcome: "error", reasonCode: "totp_missing", detail: { login: "缺少 2FA 密钥（TOTP），无法自动过两步验证" } });
-  }
 
   // 开页重试：清空数据(clearDataForOrigin)后浏览器要花几秒重建 frame，
   // 这期间任何 page 的 goto 都会 detached。所以：
   //   1) 先给一段 settle 等清理动作落地；
   //   2) 失败就从 browser 新开干净 page 再来（废掉的 page 上重试没意义）；
   //   3) 重试窗口放宽到 ~16s，覆盖清理高峰。
-  const opened = await openLoginPage(page, ctx);
+  const opened = await (ctx && ctx.openLoginPage ? ctx.openLoginPage : openLoginPage)(page, ctx);
   if (opened.error) return tagLogin({ outcome: "error", reasonCode: "browser_start_failed", detail: { login: `打开登录页失败：${opened.error.message}` } });
   page = opened.page;
 
   const flowMeta = { passwordSubmitted: false };
-  const r = await driveAuthFlow(page, account, emit, {
+  const r = await (ctx && ctx.driveAuthFlow ? ctx.driveAuthFlow : driveAuthFlow)(page, account, emit, {
     label: "login",
     flowMeta,
+    captchaSolver: ctx && ctx.captchaSolver,
+    signal: ctx && ctx.signal,
     // 登录成功：到 myaccount，或离开 accounts.google.com 到其它 google 子域（且已填过邮箱密码）。
     isDone: (host, path, st) => host === "myaccount.google.com"
       || (host && host.endsWith("google.com") && host !== "accounts.google.com" && st.emailFilled && st.passwordFilled),
@@ -983,18 +1079,61 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
   let lastTotpCounter = null;
   // Google 偶发「出了点问题，请重试」的 unknownerror 页尝试次数（多为瞬时/风控，需重试而非空转）。
   let unknownErrorTries = 0;
+  let recoverySubmitted = false;
+  let recoveryMethodTries = 0;
+  let recoverySwitchTries = 0;
+  // Login and add-2fa reauthentication share the same per-account solver scope.
+  const previousCaptchaAttempts = opts.captchaSolver?.getAttemptCount?.();
+  let captchaAttempts = Number.isInteger(previousCaptchaAttempts) && previousCaptchaAttempts >= 0
+    ? previousCaptchaAttempts : 0;
+  let captchaAccepted = false;
 
   for (let step = 0; step < 40; step += 1) {
+    checkCancelled(opts.signal);
     // 首轮不空等（页面刚 goto 完已可读），之后每步只等 800ms 让页面 settle。
     if (step > 0) await sleep(800);
     const url = page.url();
     const { host, path } = parseLoc(url);
     const text = await bodyText(page);
-    emit(`${label}_state`, { step, url: url.slice(0, 80) });
+    // 身份验证 URL 的查询参数可能包含会话凭据，诊断只保留页面路径。
+    emit(`${label}_state`, { step, url: diagnosticPageUrl(url) });
 
     // g.co/sc 安全代码页虽可能带「Verify it's you」，但它可以切换到身份验证器，不能先当风险页终止。
     const onSecurityCode = isSecurityCodeChallenge(text, url);
     const risk = onSecurityCode ? "" : riskReason(text, url);
+    if (hasGoogleRejectionText(text, url)) {
+      return { outcome: "need_verify", reasonCode: "risk_verification", detail: { [label]: "Google 拒绝验证「确认是你本人」，已停止后续操作" } };
+    }
+    if (opts.captchaSolver && !passwordOnly && host === "accounts.google.com"
+      && /\/challenge(?:\/|$)/i.test(path) && !/浏览器环境不安全/.test(risk)) {
+      const captcha = await handleLoginCaptcha(page, account, {
+        solver: opts.captchaSolver, signal: opts.signal, emit,
+        forceCaptcha: /人机验证/.test(risk), attempts: captchaAttempts,
+        onAttempt: (count) => { captchaAttempts = count; },
+      });
+      if (captcha.handled) {
+        if (captcha.resumed) { captchaAccepted = true; continue; }
+        if (captcha.reasonCode === "captcha_detection_failed") {
+          return { outcome: "error", reasonCode: captcha.reasonCode, detail: { [label]: captcha.message },
+            keepOpen: true, handoff: true };
+        }
+        return { outcome: "need_verify", reasonCode: "captcha", detail: { [label]: captcha.message } };
+      }
+    }
+    // 登录中的强制手机号关卡不是 TOTP，绝不往电话框填动态码或点击发送短信。
+    // 敏感设置的 reauth 可保留原有“切回验证器”逻辑；普通登录则明确记录并停止。
+    if (!passwordOnly && (!preferAuthenticator || captchaAccepted)) {
+      const phone = classifyLoginPhoneChallenge({ url, text });
+      if (phone) {
+        const reasonCode = `${captchaAccepted ? "captcha_" : ""}${phone.reasonCode}`;
+        const requirement = phone.kind === "add" ? "添加手机号" : "验证手机号或接收短信";
+        emit("login_phone_required", { kind: phone.kind, afterCaptcha: captchaAccepted });
+        return {
+          outcome: "need_verify", reasonCode,
+          detail: { [label]: `${captchaAccepted ? "人机验证通过后，Google 仍要求" : "Google 要求"}${requirement}；未填写号码、未发送短信，已停止后续操作` },
+        };
+      }
+    }
     if (risk) return { outcome: "need_verify", detail: { [label]: risk } };
 
     if (/\/disabled\b|deniedsigninrejected/i.test(path)) {
@@ -1002,13 +1141,13 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
     }
 
     // Google 拒绝「确认是你本人」：环境/IP 不被信任，敏感操作无法自动完成，需人工在常用设备上操作。
-    if (/\/signin\/rejected/i.test(path) || /we couldn'?t verify it'?s you|couldn'?t verify it'?s you|无法验证是你本人|未能验证是您本人/i.test(text)) {
+    if (/\/signin\/rejected/i.test(path)) {
       return { outcome: "need_verify", reasonCode: "risk_verification", detail: { [label]: "Google 拒绝验证「确认是你本人」（环境/IP 不被信任），无法自动完成，需人工在常用设备上操作" } };
     }
 
     if (isDone(host, path, st)) {
       emit(`${label}_done`, {});
-      return { outcome: "ok", reasonCode: "ok", detail: { [label]: "通过" }, fieldPatch: {} };
+      return { outcome: "ok", reasonCode: "ok", detail: { [label]: recoverySubmitted ? "通过（已确认辅助邮箱）" : "通过" }, fieldPatch: {} };
     }
 
     // 密码检测必须由本次提交来得出结论。若尚未提交密码就已经进入其它登录态/验证页，
@@ -1078,6 +1217,18 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
           };
         }
       }
+    }
+
+    // Explicit recovery-email address confirmation precedes generic email/password
+    // field detection: Google may retain those old inputs on its challenge pages.
+    const recoveryPhase = classifyRecoveryEmail(text, url);
+    if (!passwordOnly && recoveryPhase) {
+      if (recoverySubmitted) return { outcome: "need_verify", reasonCode: "timeout", detail: { [label]: "辅助邮箱已提交，Google 再次要求确认；已停止重复提交" } };
+      emit("confirming_recovery_email", {});
+      const recovery = await submitRecoveryEmail(page, account, { label, bodyText, observe: observeRecoveryEmail, emit, fillField, ensureValue, clickNext: clickRecoveryEmailNext, sleep });
+      if (!recovery.advanced) return recovery;
+      recoverySubmitted = true;
+      continue;
     }
 
     // 2FA「验证码错误」：密钥多半不对（每次生成的码都不对）。连续错 2 次就立刻停下并明确提示，
@@ -1225,7 +1376,7 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
       }
       // 验证方式列表页：优先选「身份验证器」。
       emit("choose_2fa_method", {});
-      if (await hasAuthenticatorOption(page)) {
+      if (account.totpSecret && await hasAuthenticatorOption(page)) {
         selectionEmptyTries = 0;
         authSwitchTries += 1;
         if (authSwitchTries > 6) {
@@ -1240,6 +1391,15 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
         await sleep(1200);
         continue;
       }
+      // Only the address-confirmation option is supported, never a Send-code
+      // choice. Keep normal TOTP preference for accounts that have a secret.
+      if (account.recoveryEmail && await hasRecoveryEmailOption(page)) {
+        recoveryMethodTries += 1;
+        if (recoveryMethodTries > 3) return { outcome: "need_verify", reasonCode: "unknown_challenge", detail: { [label]: "无法进入辅助邮箱确认页面，已停止" } };
+        emit("choose_recovery_email", {});
+        await chooseRecoveryEmailMethod(page);
+        continue;
+      }
       // URL 可能已到 selection，但选项 DOM 还没有 hydration。先给有限 grace，不在第一轮误判“无身份验证器”。
       if (onSelection) {
         selectionEmptyTries += 1;
@@ -1248,7 +1408,7 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
         return {
           outcome: "need_verify",
           reasonCode: "no_supported_2fa",
-          detail: { [label]: "该账号两步验证仅有设备通知/安全密钥等方式，无「身份验证器」选项，无法自动完成，需人工验证" },
+          detail: { [label]: "没有可用的身份验证器或辅助邮箱地址确认方式，需人工验证" },
         };
       }
     }
@@ -1328,6 +1488,16 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
     // 2FA / TOTP：只有明确处于身份验证器上下文时才允许填码。通用的“verification code / 输入验证码”
     // 不能作为依据，因为安全代码、短信、备用码页面也有同样文案和 6 位输入框。
     if (isAuthenticatorTotpContext(text, url)) {
+      if (!account.totpSecret) {
+        if (account.recoveryEmail) {
+          recoverySwitchTries += 1;
+          emit("switch_to_recovery_email", { tries: recoverySwitchTries });
+          if (recoverySwitchTries <= 3 && await openAlternativeMethods(page)) continue;
+          if (recoverySwitchTries < 3) continue;
+          return { outcome: "need_verify", reasonCode: "no_supported_2fa", detail: { [label]: "账号没有验证器密钥，且无法切换到辅助邮箱确认方式，需人工处理" } };
+        }
+        return { outcome: "need_verify", reasonCode: "totp_missing", detail: { [label]: "Google 要求身份验证器动态码，但账号没有 2FA 密钥" } };
+      }
       if (!totpInputVisible) {
         await page.waitForSelector(TOTP_SELECTOR_CSS, { visible: true, timeout: 6000 }).catch(() => {});
         continue;
@@ -1375,7 +1545,7 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
       return {
         outcome: "need_verify",
         reasonCode: "unknown_challenge",
-        detail: { [label]: `遇到尚未识别的 Google 验证页面，已停止自动点击：${url.slice(0, 100)}` },
+        detail: { [label]: `遇到尚未识别的 Google 验证页面，已停止自动点击：${diagnosticPageUrl(url)}` },
       };
     }
   }
@@ -1383,7 +1553,7 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
   return {
     outcome: "need_verify",
     reasonCode: "timeout",
-    detail: { [label]: `未完成，停在：${page.url().slice(0, 80)}` },
+    detail: { [label]: `未完成，停在：${diagnosticPageUrl(page.url())}` },
   };
 }
 
@@ -1393,9 +1563,11 @@ async function driveAuthFlow(page, account, emit, opts = {}) {
  */
 async function reauth(page, account, ctx) {
   const emit = ctx && ctx.emit ? ctx.emit : () => {};
-  return driveAuthFlow(page, account, emit, {
+  return (ctx && ctx.driveAuthFlow ? ctx.driveAuthFlow : driveAuthFlow)(page, account, emit, {
     label: "reauth",
     preferAuthenticator: !!(ctx && ctx.preferAuthenticator),
+    captchaSolver: ctx && ctx.captchaSolver,
+    signal: ctx && ctx.signal,
     isDone: (host) => !!host && host !== "accounts.google.com",
   });
 }
@@ -1404,7 +1576,7 @@ module.exports = login;
 module.exports.reauth = reauth;
 module.exports.checkPassword = checkPassword;
 module.exports.helpers = {
-  sleep, parseLoc, visibleFirst, fillField, setValueViaJs, ensureValue, curValue,
+  sleep, parseLoc, diagnosticPageUrl, visibleFirst, fillField, setValueViaJs, ensureValue, curValue,
   clickText, clickNext, submitStep, fillTotp, bodyText, SKIP_SOURCES,
   totpCounter, totpSubmitPlan, TOTP_STEP, MIN_TOTP_MARGIN_SEC,
   withTimeout, realClickHandle, realClickByText, hasAuthenticatorOption,
@@ -1412,6 +1584,7 @@ module.exports.helpers = {
   isSecurityCodeChallenge, isAuthenticatorTotpContext, shouldFillTotp, isDevicePromptChallenge,
   waitForAuthMethodList, openAlternativeMethods, waitForAuthenticatorTotp, chooseAuthenticatorMethod,
   riskReason, isAccountChooserContext, driveAuthFlow, openLoginPage, submitPasswordOnce, submitPasswordCheck, tagPasswordCheck, isPasswordAcceptedDestination,
+  classifyRecoveryEmail, submitRecoveryEmail, hasRecoveryEmailOption, chooseRecoveryEmailMethod, clickRecoveryEmailNext,
   IPP_CONSENT_RE, VERIFY_SENDCODE_RE, isSmsConsentTextFallback,
   classifyPasswordProblem, extractPwdChangeDays, PWD_CHANGED_RE, WRONG_PWD_RE,
   LOGIN_REASON_CODES, loginDetailText, normalizedPasswordChangedDays, inferLoginReasonCode, tagLogin,

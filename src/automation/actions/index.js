@@ -14,8 +14,10 @@ const login = require("./login");
 const detectBan = require("./detect-ban");
 const detectRestrict = require("./detect-restrict");
 const detectRegion = require("./detect-region");
+const detectCloudPhone = require("./detect-cloud-phone");
 const detectGpt = require("./detect-gpt");
 const changeLanguage = require("./change-language");
+const add2fa = require("./add-2fa");
 const change2fa = require("./change-2fa");
 const removeDevices = require("./remove-devices");
 const removePhones = require("./remove-phones");
@@ -28,7 +30,7 @@ const closePayment = require("./close-payment");
 
 const REGISTRY = {
   "login": {
-    label: "登录账号（自动填邮箱/密码/2FA）",
+    label: "登录账号（邮箱/密码，可选 2FA 或辅助邮箱）",
     risk: "medium",
     readOnly: true,
     run: login,
@@ -58,6 +60,13 @@ const REGISTRY = {
     readOnly: true,
     run: detectRegion,
   },
+  "detect-cloud-phone": {
+    label: "原号检测（Cloud 电话验证）",
+    risk: "medium",
+    // Optional first-use consent changes Cloud onboarding state.
+    readOnly: false,
+    run: detectCloudPhone,
+  },
   "detect-gpt": {
     label: "检测 GPT 一键授权（用 Google 登录 ChatGPT，弹「无法验证身份」=失败）",
     risk: "medium",
@@ -69,6 +78,13 @@ const REGISTRY = {
     risk: "low",
     readOnly: false,
     run: changeLanguage,
+  },
+  "add-2fa": {
+    label: "添加身份验证器（未设置账号）",
+    risk: "high",
+    readOnly: false,
+    exclusive: true,
+    run: add2fa,
   },
   "change-2fa": {
     label: "更改 2FA 密钥（更换验证器，写操作！）",

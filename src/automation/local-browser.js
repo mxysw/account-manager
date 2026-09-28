@@ -49,18 +49,62 @@ function findExecutable() {
 }
 
 /** 探测一个空闲 TCP 端口（绑 0 让系统分配，再关掉拿到端口号）。 */
-function freePort() {
+function abortError() {
+  const error = new Error("任务已取消");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal && signal.aborted) throw abortError();
+}
+
+function freePort(signal) {
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
-    srv.on("error", reject);
+    let settled = false;
+    const finish = (error, port) => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener("abort", onAbort);
+      if (error) reject(error);
+      else resolve(port);
+    };
+    const onAbort = () => {
+      try { srv.close(); } catch (_) { /* listening 回调也会检查取消，避免迟到的监听泄漏 */ }
+      finish(abortError());
+    };
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    srv.on("error", (error) => finish(error));
     srv.listen(0, "127.0.0.1", () => {
+      if (settled || (signal && signal.aborted)) {
+        srv.close();
+        finish(abortError());
+        return;
+      }
       const { port } = srv.address();
-      srv.close(() => resolve(port));
+      srv.close((error) => finish(error, port));
     });
   });
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function sleep(ms, signal) {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      reject(abortError());
+    };
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 /**
  * Chrome 冷启动时 /json/version 可能先返回 Browser 字段，稍后才补上真正可连接的
@@ -78,50 +122,159 @@ function isDevtoolsReady(version) {
 }
 
 /** 轮询 /json/version，等调试端口真正可用后返回该响应里的端点信息。 */
-function probeDevtools(port) {
-  return new Promise((resolve) => {
+function probeDevtools(port, signal) {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (value, error) => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener("abort", onAbort);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const onAbort = () => { finish(null, abortError()); req.destroy(); };
     const req = http.get({ hostname: "127.0.0.1", port, path: "/json/version", timeout: 1500 }, (res) => {
       let data = "";
       res.setEncoding("utf8");
       res.on("data", (c) => (data += c));
       res.on("end", () => {
-        try { resolve(JSON.parse(data || "{}")); } catch (_) { resolve(null); }
+        try { finish(JSON.parse(data || "{}")); } catch (_) { finish(null); }
       });
+      res.on("error", () => finish(null));
     });
-    req.on("error", () => resolve(null));
-    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.on("error", () => finish(null));
+    req.on("timeout", () => { finish(null); req.destroy(); });
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    if (signal && signal.aborted) onAbort();
   });
 }
 
-async function waitForDevtools(port, totalMs = 30000) {
+async function waitForDevtools(port, totalMs = 30000, signal) {
+  throwIfAborted(signal);
   const deadline = Date.now() + totalMs;
   while (Date.now() < deadline) {
-    const v = await probeDevtools(port);
+    const v = await probeDevtools(port, signal);
+    throwIfAborted(signal);
     if (isDevtoolsReady(v)) return v;
-    await sleep(300);
+    await sleep(Math.min(300, Math.max(0, deadline - Date.now())), signal);
   }
   return null;
+}
+
+function cleanupTempDir(userDataDir) {
+  const resolved = path.resolve(userDataDir);
+  const tempRoot = fs.realpathSync(os.tmpdir());
+  if (path.dirname(resolved) !== path.resolve(os.tmpdir()) || !/^am-local-[a-z0-9]+$/i.test(path.basename(resolved))) {
+    throw new Error("临时浏览器目录超出允许范围，未删除");
+  }
+  if (!fs.existsSync(resolved)) return;
+  const actual = fs.realpathSync(resolved);
+  if (path.dirname(actual).toLowerCase() !== tempRoot.toLowerCase()) throw new Error("临时浏览器目录指向非预期位置，未删除");
+  fs.rmSync(resolved, { recursive: true, force: true });
+}
+
+function killWindowsTree(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return Promise.reject(new Error("临时浏览器进程号无效，未关闭任何进程"));
+  const spawnProcess = options.spawn || spawn;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let killer;
+    let timer;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve();
+    };
+    try {
+      // 只针对本次 spawn 的根 PID 和其子进程，不按 chrome.exe 名称或全局进程列表关闭。
+      killer = spawnProcess("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      killer.once("error", () => finish(new Error("无法启动临时浏览器进程关闭命令")));
+      killer.once("exit", (code) => finish(code === 0 ? null : new Error(`临时浏览器进程树关闭失败（退出码 ${code}）`)));
+      if (!settled) timer = setTimeout(() => {
+        finish(new Error("关闭临时浏览器进程超时"));
+        try { killer.kill(); } catch (_) { /* 只停止本次创建的 taskkill 辅助进程 */ }
+      }, Math.max(1, Number(options.timeoutMs) || 5000));
+    } catch (_) { finish(new Error("无法执行临时浏览器进程关闭命令")); }
+  });
+}
+
+/** 并发 stop 共用同一 Promise；失败可重试，只有确认进程退出才删除本次专有 profile。 */
+function createProcessStop(child, cleanupDir, options = {}) {
+  let exited = child.exitCode != null || child.signalCode != null;
+  let stopped = false;
+  let stopping = null;
+  child.once("exit", () => { exited = true; });
+  child.once("error", () => { if (!child.pid) exited = true; });
+  const wait = options.sleep || sleep;
+  const platform = options.platform || process.platform;
+  const confirmExit = async (timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!exited && Date.now() < deadline) await wait(Math.min(50, Math.max(1, deadline - Date.now())));
+    return exited;
+  };
+  const run = async () => {
+    if (!exited) {
+      if (platform === "win32") {
+        let killError = null;
+        try { await (options.killWindowsTree || killWindowsTree)(child.pid, options); }
+        catch (error) { killError = error; }
+        // Chrome 子进程会随根进程退出；taskkill 遍历过程中碰到刚退出的子进程时可能
+        // 返回 128/255。只在本次 spawn 的 ChildProcess 已发出 exit 后认可关闭成功，
+        // 不能只按 taskkill 的错误码忽略失败，也不能据 PID 查询误认复用的其它进程。
+        if (!await confirmExit(Number(options.exitTimeoutMs) || 3000)) {
+          throw killError || new Error("临时浏览器进程尚未退出，窗口关闭未确认");
+        }
+      } else {
+        if (!child.kill("SIGTERM") && !exited) throw new Error("临时浏览器未接受关闭请求");
+        if (!await confirmExit(Number(options.graceMs) || 500)) {
+          if (!child.kill("SIGKILL") && !exited) throw new Error("临时浏览器强制关闭失败");
+        }
+      }
+      if (!await confirmExit(Number(options.exitTimeoutMs) || 3000)) throw new Error("临时浏览器进程尚未退出，窗口关闭未确认");
+    }
+    let cleanupError = null;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try { await cleanupDir(); cleanupError = null; break; } catch (error) { cleanupError = error; }
+      if (attempt < 4) await wait(100);
+    }
+    if (cleanupError) throw new Error(`临时浏览器已退出，但数据目录清理失败：${cleanupError.message}`);
+    stopped = true;
+    return { ok: true };
+  };
+  return function stop() {
+    if (stopped) return Promise.resolve({ ok: true });
+    if (stopping) return stopping;
+    stopping = run().finally(() => { stopping = null; });
+    return stopping;
+  };
 }
 
 /**
  * 启动一个本机临时浏览器并等待其 CDP 调试端口就绪。
  * @param {object} opts
  * @param {boolean} [opts.clearData] 是否在关闭后清理临时数据目录（本模式恒为临时目录，恒清理）。
+ * @param {AbortSignal} [opts.signal] 取消启动探测并关闭本次专有浏览器；返回句柄后依然生效。
+ * @param {boolean} [opts.background] 严格为 true 时最小化启动；保留任务栏入口，不使用无头模式。
  * @param {string}  [opts.proxy] 代理服务器（如 "http://user:pass@host:port" 或 "socks5://host:port"）。
  *        —— 规划中字段：当前 UI 暂未对接代理导入，仅预留启动参数入口；传入即透传给 --proxy-server。
  * @returns {Promise<{cdpEndpoint:string, port:number, pid:number, userDataDir:string, stop:Function}>}
  */
-async function start(opts = {}) {
-  const exe = findExecutable();
+async function start(opts = {}, deps = {}) {
+  const signal = opts.signal;
+  throwIfAborted(signal);
+  const exe = (deps.findExecutable || findExecutable)();
   if (!exe) {
     throw new Error(
       "未找到本机浏览器（Chrome/Edge）。请安装 Chrome，或用环境变量 LOCAL_BROWSER_PATH 指定浏览器可执行文件路径。",
     );
   }
 
-  const port = await freePort();
+  const port = await (deps.freePort || freePort)(signal);
+  throwIfAborted(signal);
   // 一次性临时 user-data-dir，stop 时整目录删除（ephemeral，不长期保留 profile）。
-  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "am-local-"));
+  const userDataDir = (deps.createProfileDir || (() => fs.mkdtempSync(path.join(os.tmpdir(), "am-local-"))))();
 
   const args = [
     `--remote-debugging-port=${port}`,
@@ -167,51 +320,74 @@ async function start(opts = {}) {
     "about:blank",
   ];
 
+  // 保留有界面浏览器及任务栏入口；CDP 接管后会再次确认最小化并处理新弹窗。
+  if (opts.background === true) args.unshift("--start-minimized");
+
   // 代理（规划中）：若调用方传入 proxy，则透传给浏览器自身的 --proxy-server。
   // 这样代理由浏览器进程处理，后续用户只需把代理数据「导入」到这里即可，无需对接 AdsPower 代理池。
   if (opts.proxy) {
     args.unshift(`--proxy-server=${String(opts.proxy)}`);
   }
 
-  const child = spawn(exe, args, { stdio: "ignore", windowsHide: false });
-  child.on("error", () => { /* 启动失败由下面的 waitForDevtools 兜底报错 */ });
-
-  let exited = false;
-  child.on("exit", () => { exited = true; });
-
-  const cleanupDir = () => {
-    try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+  const cleanupDir = () => (deps.cleanupDir || cleanupTempDir)(userDataDir);
+  let child;
+  try { child = (deps.spawn || spawn)(exe, args, { stdio: "ignore", windowsHide: false }); }
+  catch (error) { cleanupDir(); throw error; }
+  const stopProcess = createProcessStop(child, cleanupDir, deps);
+  const readiness = new AbortController();
+  let launchError = null;
+  const onChildError = (error) => { launchError = error; readiness.abort(); };
+  const onChildExit = () => { launchError = new Error("临时浏览器在调试端口就绪前已退出"); readiness.abort(); };
+  child.once("error", onChildError);
+  child.once("exit", onChildExit);
+  const onAbort = () => {
+    readiness.abort();
+    // 启动期/返回句柄之后都可中止；引擎同时调用 stop 时会加入同一个关闭 Promise。
+    void stop().catch(() => { /* 调用方的 start/stop 会读取并报告关闭失败 */ });
   };
-
-  const version = await waitForDevtools(port, 30000);
-  if (!version) {
-    try { child.kill("SIGKILL"); } catch (_) { /* ignore */ }
-    cleanupDir();
-    throw new Error(`本机浏览器启动后调试端口 ${port} 未就绪（30s 超时）。可执行文件：${exe}`);
-  }
-
-  return {
+  let stoppingResult = null;
+  const stop = () => {
+    if (stoppingResult) return stoppingResult;
+    stoppingResult = stopProcess().then((result) => {
+      if (signal) signal.removeEventListener("abort", onAbort);
+      return result;
+    }).finally(() => { stoppingResult = null; });
+    return stoppingResult;
+  };
+  if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  if (signal && signal.aborted) onAbort();
+  const handle = {
     cdpEndpoint: `http://127.0.0.1:${port}`,
     port,
     pid: child.pid,
     userDataDir,
     executablePath: exe,
-    /** 关闭浏览器进程并清理临时目录（用完即弃）。 */
-    async stop() {
-      if (!exited) {
-        try { child.kill(); } catch (_) { /* ignore */ }
-        // 给优雅退出一点时间，超时则强杀，避免游离进程。
-        const deadline = Date.now() + 3000;
-        while (!exited && Date.now() < deadline) await sleep(150);
-        if (!exited) { try { child.kill("SIGKILL"); } catch (_) { /* ignore */ } }
-      }
-      cleanupDir();
-    },
+    stop,
   };
+  try {
+    const version = await (deps.waitForDevtools || waitForDevtools)(port, 30000, readiness.signal);
+    throwIfAborted(signal);
+    if (launchError) throw launchError;
+    if (!version) throw new Error(`本机浏览器启动后调试端口 ${port} 未就绪（30s 超时）。可执行文件：${exe}`);
+    return handle;
+  } catch (error) {
+    readiness.abort();
+    try { await stop(); } catch (cleanupError) {
+      const failure = new Error(`浏览器启动已停止，但关闭/清理尚未成功：${cleanupError.message}`);
+      failure.cleanupFailed = true;
+      failure.local = handle;
+      throw failure;
+    }
+    if (signal && signal.aborted) throw abortError();
+    throw launchError || error;
+  } finally {
+    child.removeListener("error", onChildError);
+    child.removeListener("exit", onChildExit);
+  }
 }
 
 module.exports = {
   start,
   findExecutable,
-  helpers: { isDevtoolsReady, waitForDevtools },
+  helpers: { isDevtoolsReady, waitForDevtools, probeDevtools, freePort, sleep, abortError, throwIfAborted, createProcessStop, killWindowsTree, cleanupTempDir },
 };

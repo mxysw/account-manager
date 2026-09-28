@@ -89,6 +89,8 @@ class AdsPower {
       ip_tab: 0,
     };
     if (opts.clearCache) query.clear_cache_after_closing = 1;
+    // 后台模式在 CDP 接管后最小化。这里不传 launch_args：AdsPower 会用它
+    // 覆盖环境原有启动参数，不能为窗口偏好丢掉用户已配置的参数。
     // 改过指纹/代理后第一次开窗往往很慢，给到 90s 超时。
     let r = null;
     let cdp = "";

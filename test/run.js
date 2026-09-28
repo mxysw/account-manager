@@ -85,6 +85,22 @@ check("解析 ---- 分隔 + 辅助邮箱", () => {
   assert.strictEqual(p.totpSecret, "KZXW6YTBOI5XW4TBOIQXG5DBNJ");
 });
 
+check("解析 邮箱:密码 + 无辅助邮箱/2FA", () => {
+  const p = accounts.parseLine("password-only\\@example.com:fixture:password");
+  assert.strictEqual(p.email, "password-only@example.com");
+  assert.strictEqual(p.password, "fixture:password", "第一个冒号后的内容都应保留为密码");
+  assert.strictEqual(p.recoveryEmail, "");
+  assert.strictEqual(p.totpSecret, "");
+
+  const withLegacySeparators = accounts.parseLine("password-only@example.com:fixture|part----tail");
+  assert.strictEqual(withLegacySeparators.password, "fixture|part----tail", "冒号格式密码中的旧分隔符也必须原样保留");
+
+  const legacyPipe = accounts.parseLine("legacy@example.com|fixture:password|JBSWY3DPEHPK3PXP");
+  assert.strictEqual(legacyPipe.password, "fixture:password", "旧竖线格式的密码可包含冒号");
+  const legacyDash = accounts.parseLine("legacy@example.com----fixture:password----JBSWY3DPEHPK3PXP");
+  assert.strictEqual(legacyDash.password, "fixture:password", "旧横线格式的密码可包含冒号");
+});
+
 check("非法格式抛错", () => {
   assert.throws(() => accounts.parseLine("no-separator-line"));
 });
@@ -96,14 +112,19 @@ check("复制和导出账号时追加具体异常原因", () => {
   const reasonEnd = appSource.indexOf("const STATUS_OPTIONS", reasonStart);
   assert.ok(reasonStart >= 0 && reasonEnd > reasonStart, "应能找到登录原因文案");
   const reasonHelpers = new Function(`${appSource.slice(reasonStart, reasonEnd)}\nreturn { LOGIN_REASON_TEXT, passwordCheckResultText, loginCheckResultText };`)();
+  const cloudTextStart = appSource.indexOf("function cloudPhoneResultText(");
+  const cloudTextEnd = appSource.indexOf("function cloudPhoneStateOf(", cloudTextStart);
+  assert.ok(cloudTextStart >= 0 && cloudTextEnd > cloudTextStart, "应能找到原号检测结果文案");
+  const cloudPhoneResultText = new Function(`${appSource.slice(cloudTextStart, cloudTextEnd)}\nreturn cloudPhoneResultText;`)();
 
   const start = appSource.indexOf("const EXPORT_STATUS_WARNING_TEXT");
   const end = appSource.indexOf("let toastTimer", start);
   assert.ok(start >= 0 && end > start, "应能找到账号复制/导出格式函数");
-  const helpers = new Function("LOGIN_REASON_TEXT", "passwordCheckResultText", "loginCheckResultText", `${appSource.slice(start, end)}\nreturn { fmtAccount, hasExportWarning, exportWarningText };`)(
+  const helpers = new Function("LOGIN_REASON_TEXT", "passwordCheckResultText", "loginCheckResultText", "cloudPhoneResultText", `${appSource.slice(start, end)}\nreturn { fmtAccount, hasExportWarning, exportWarningText };`)(
     reasonHelpers.LOGIN_REASON_TEXT,
     reasonHelpers.passwordCheckResultText,
     reasonHelpers.loginCheckResultText,
+    cloudPhoneResultText,
   );
   const normal = {
     email: "normal@example.com", password: "pw", recoveryEmail: "", totpSecret: "KEY", year: "2026", country: "US",
@@ -214,6 +235,11 @@ check("登录结果同时产生粗状态和可持久化精确原因", () => {
 
   const existingSession = tagLogin({ outcome: "ok", reasonCode: "ok", passwordSubmitted: false, detail: { login: "已有会话" } });
   assert.strictEqual(Object.prototype.hasOwnProperty.call(existingSession.fieldPatch, "lastPasswordCheck"), false, "已有会话未提交本次密码，不能清旧密码检测");
+
+  for (const reasonCode of ["recovery_email_missing", "recovery_email_wrong", "recovery_email_code_required"]) {
+    const recoveryChallenge = tagLogin({ outcome: "need_verify", reasonCode, passwordSubmitted: true, detail: { login: "辅助邮箱挑战" } });
+    assert.strictEqual(recoveryChallenge.fieldPatch.lastPasswordCheck, null, `${reasonCode} 发生在密码通过后，应清除旧密码检测`);
+  }
 });
 
 check("仅验证密码使用独立结果，不冒充完整登录成功", () => {
@@ -1756,7 +1782,7 @@ check("手机号池任务轮询不会打断备注/状态编辑", () => {
     (id) => (id === "phoneRows" ? modeRows : null),
   );
   assert.strictEqual(detectModeEditing(), true, "切换共享/独享模式时轮询不能把下拉框重绘掉");
-  assert.match(appSource, /loadPhones\(\{\s*skipIfEditing:\s*true\s*\}\)/, "手机号动作轮询必须使用编辑保护");
+  assert.match(appSource, /loadPhones\(\{\s*skipIfEditing:\s*true(?:\s*,\s*signal:\s*controller\.signal)?\s*\}\)/, "手机号动作轮询必须使用编辑保护");
 });
 
 check("手机号 UI/文档以直接添加和稍后生效为默认，验证码仅作条件分支", () => {
@@ -1772,13 +1798,15 @@ check("手机号 UI/文档以直接添加和稍后生效为默认，验证码仅
   assert.ok(!readmeSource.includes("再填写号码并请求短信验证码"), "不能把请求短信验证码写成默认流程");
   assert.match(htmlSource, /id="phoneImportMode"[\s\S]*value="shared"[\s\S]*value="exclusive"/);
   assert.match(htmlSource, /id="phoneRunMode"[\s\S]*value="shared"[\s\S]*value="exclusive"/);
-  assert.match(htmlSource, /id="manualChallengePolicy"[\s\S]*value="close"[\s\S]*value="keep"/,
-    "批量操作必须提供需人工验证时自动关闭/保留窗口的独立选项");
+  assert.match(htmlSource, /id="manualChallengePolicy"[\s\S]*value="close"[\s\S]*value="keep"[\s\S]*value="solve_close"/,
+    "批量操作必须提供检测后关闭、保留、自动打码后关闭三种策略");
   assert.match(appSource, /JSON\.stringify\(\{ text, usageMode \}\)/, "导入请求必须携带手机号分配模式");
   assert.match(appSource, /phoneMode:\s*readPhoneRunMode\(\)/, "自动化任务必须携带本次领取模式");
-  assert.match(appSource, /manualChallengePolicy:\s*el\("manualChallengePolicy"\)\.value/,
-    "自动化任务必须携带需人工验证窗口策略");
-  assert.match(appSource, /f\.manualChallengePolicy === "close"[\s\S]*f\.manualChallengePolicy === "keep"/,
+  assert.match(appSource, /const manualChallengePolicy = el\("manualChallengePolicy"\)\.value/,
+    "自动化任务必须在启动时快照需人工验证窗口策略");
+  assert.match(appSource, /keepOpen,\s*manualChallengePolicy,\s*captchaSolver/,
+    "自动化任务必须发送快照的窗口策略，不能被保存密钥期间的控件变更覆盖");
+  assert.match(appSource, /\["close", "keep", "solve_close"\]\.includes\(f\.manualChallengePolicy\)/,
     "刷新后只能恢复合法的需人工验证窗口策略");
   assert.match(appSource, /共享可用（已绑 \$\{count\}）/);
   assert.match(appSource, /data-phone-mode/);
@@ -1850,6 +1878,12 @@ check("添加两步验证手机号已注册为高风险写操作、动作独占�
     "没有需人工验证时，普通跑完保留选项仍应生效");
   assert.strictEqual(engine.helpers.shouldRetainTaskWindow(false, false, "keep"), false,
     "人机保留不能把正常完成窗口也留下");
+  for (const keepOpen of [false, true]) {
+    for (const actionKeepOpen of [false, true]) {
+      assert.strictEqual(engine.helpers.shouldRetainTaskWindow(keepOpen, actionKeepOpen, "solve_close"), false,
+        "自动打码策略无论完成、失败或动作请求人工接管，都必须关闭窗口");
+    }
+  }
 });
 
 check("添加手机号忽略全局保留窗口，普通成功后对应环境仍可继续下一个账号", () => {
@@ -2170,6 +2204,98 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
 });
 
 (async () => {
+  await checkAsync("完整登录支持纯账号密码，不要求辅助邮箱或 2FA", async () => {
+    let phase = "email";
+    const values = { email: "", password: "" };
+    const events = [];
+    const urlByPhase = {
+      email: "https://accounts.google.com/v3/signin/identifier",
+      password: "https://accounts.google.com/v3/signin/challenge/pwd",
+      done: "https://myaccount.google.com/",
+    };
+    const selectors = {
+      email: new Set(["input[type='email']", "input[name='identifier']", "#identifierId"]),
+      password: new Set(["input[type='password']", "input[name='Passwd']"]),
+    };
+    const makeInput = (kind) => ({
+      evaluate: async (fn, value) => {
+        const source = String(fn);
+        if (source.includes("getBoundingClientRect")) return true;
+        if (source.includes('n.value = ""')) { values[kind] = ""; return undefined; }
+        if (value !== undefined) { values[kind] = String(value); return values[kind]; }
+        return values[kind];
+      },
+      click: async () => {},
+      type: async (value) => { values[kind] += String(value); },
+      dispose: async () => {},
+    });
+    const page = {
+      url: () => urlByPhase[phase],
+      $: async (selector) => {
+        if (phase === "email" && selectors.email.has(selector)) return makeInput("email");
+        if (phase === "password" && selectors.password.has(selector)) return makeInput("password");
+        return null;
+      },
+      evaluate: async (fn) => {
+        const source = String(fn);
+        if (source.includes("document.body")) {
+          if (phase === "email") return "Sign in Email or phone";
+          if (phase === "password") return "Welcome Enter your password";
+          return "Google Account";
+        }
+        if (source.includes("const ids")) {
+          if (phase === "email" && values.email === "password-only@example.com") { phase = "password"; return true; }
+          if (phase === "password" && values.password === "fixture-password") { phase = "done"; return true; }
+        }
+        return false;
+      },
+    };
+    const result = await login(page, {
+      email: "password-only@example.com",
+      password: "fixture-password",
+      recoveryEmail: "",
+      totpSecret: "",
+    }, {
+      emit: (event) => events.push(event),
+      openLoginPage: async (openedPage) => ({ page: openedPage, error: null }),
+    });
+    assert.strictEqual(result.outcome, "ok");
+    assert.strictEqual(result.reasonCode, "ok");
+    assert.strictEqual(phase, "done", "应依次提交邮箱和密码后进入账号页");
+    assert.strictEqual(values.email, "password-only@example.com");
+    assert.strictEqual(values.password, "fixture-password");
+    assert.ok(!events.includes("handling_totp"), "无 TOTP 的账号不应进入验证器填写分支");
+  });
+
+  await require("./cloud-phone")({ check, checkAsync, accounts });
+  await require("./cloud-phone-qr")({ check, checkAsync });
+  await require("./cloud-phone-qr-ui")({ check, checkAsync });
+  await require("./cloud-phone-copy")({ check });
+  await require("./cloud-shell-status")({ check, checkAsync });
+  await require("./cloud-shell-locales")({ check, checkAsync });
+  await require("./cloud-shell-ui")({ check });
+  await require("./background-browser")({ check, checkAsync });
+  await require("./background-ui")({ check, checkAsync });
+  await require("./background-engine")({ check, checkAsync });
+  await require("./recovery-email")({ check, checkAsync, accounts });
+  await require("./add-2fa")({ check, checkAsync, accounts });
+  await require("./add-2fa-recognition")({ check, checkAsync });
+  require("./add-2fa-ui")({ check });
+  await require("./add-2fa-storage")({ check, checkAsync, accounts });
+  await require("./cancel-engine")({ checkAsync });
+  await require("./cancel-local-browser")({ checkAsync });
+  await require("./cancel-ui")({ checkAsync });
+  await require("./capsolver")({ check, checkAsync });
+  await require("./capsolver-settings")({ check, checkAsync });
+  await require("./recaptcha")({ check, checkAsync });
+  await require("./recaptcha-observer")({ check, checkAsync });
+  await require("./login-captcha")({ checkAsync });
+  await require("./captcha-detection-ui-storage")({ checkAsync });
+  await require("./login-phone-challenge")({ check, checkAsync });
+  await require("./login-phone-flow")({ check, checkAsync });
+  await require("./phone-blocker-ui-storage")({ check, accounts });
+  await require("./capsolver-ui")({ check, checkAsync });
+
   await checkAsync("手机号池 HTTP API 返回脱敏 DTO，并以 409 拒绝非法/危险状态操作", async () => {
     const apiServer = http.createServer((req, res) => {
       router.handle(req, res).catch((err) => {
@@ -3436,7 +3562,8 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
       { label: "test", isDone: () => false },
     );
     assert.strictEqual(result.outcome, "need_verify");
-    assert.match(Object.values(result.detail).join(" "), /短信验证/);
+    assert.strictEqual(result.reasonCode, "phone_verification_required");
+    assert.match(Object.values(result.detail).join(" "), /验证手机号.*短信/);
     assert.strictEqual(interacted, false, "不得点击或写入 SPA 残留输入框");
   });
 
@@ -3492,7 +3619,7 @@ check("Next/Save 分阶段定位可读 visible text、aria、input value，且�
         getAttribute: (name) => (opts.attrs && Object.prototype.hasOwnProperty.call(opts.attrs, name) ? opts.attrs[name] : null),
         getBoundingClientRect: () => ({ x: 0, y: 0, width: opts.width || 240, height: opts.height || 48 }),
         closest(selector) {
-          if (selector === "[hidden], [inert]") return null;
+          if (selector === "[hidden], [inert]" || selector === "[hidden], [inert], [aria-hidden='true']") return null;
           return opts.parent || node;
         },
         scrollIntoView: () => {},

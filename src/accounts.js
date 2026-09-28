@@ -46,7 +46,10 @@ const LAST_LOGIN_REASON_CODES = new Set([
   "ok",
   "password_wrong", "password_changed", "credentials_missing",
   "totp_missing", "totp_invalid", "totp_flow_error",
-  "captcha", "device_prompt", "sms_verification", "security_code", "no_supported_2fa",
+  "recovery_email_missing", "recovery_email_wrong", "recovery_email_code_required",
+  "captcha", "captcha_detection_failed", "device_prompt", "sms_verification", "security_code", "no_supported_2fa",
+  "phone_add_required", "phone_verification_required",
+  "captcha_phone_add_required", "captcha_phone_verification_required",
   "risk_verification", "browser_blocked", "browser_start_failed",
   "account_disabled", "account_not_found",
   "unknown_challenge", "timeout", "other",
@@ -95,25 +98,43 @@ function blankStatus() {
 /**
  * 解析一行账号，字段顺序不固定：
  * 自动识别 2FA 密钥（base32）、辅助邮箱（含 @）、年份、国家。
- * 支持分隔符 `----` 与 `|`。
+ * 支持分隔符 `----`、`|`，以及纯账号密码格式 `邮箱:密码`；
+ * 辅助邮箱账号末尾的 FA 标记不作为账号字段。
  */
 function parseLine(line) {
   const value = String(line || "").trim();
   if (!value) return null;
-  const sep = value.includes("----") ? "----" : (value.includes("|") ? "|" : null);
-  if (!sep) throw new Error(`无法识别的格式：${value}`);
-  const parts = value.split(sep).map((p) => p.trim());
+  // 粘贴文本可能带 Markdown 的 \@ 转义；只规范化邮箱，密码必须原样保留。
+  const normalizeEmail = (email) => email.replace(/\\@/g, "@");
+  const colon = value.indexOf(":");
+  const dash = value.indexOf("----");
+  const pipe = value.indexOf("|");
+  const firstLegacy = [dash, pipe].filter((index) => index >= 0).reduce((min, index) => Math.min(min, index), Infinity);
+  const emailCandidate = colon > 0 ? normalizeEmail(value.slice(0, colon).trim()) : "";
+  // 冒号位于旧分隔符之前且左侧确实是邮箱时，它就是本行的分隔符；这样密码里的
+  // `|` / `----` 仍会完整保留。否则维持原有格式的优先级，避免改变历史导入语义。
+  const colonFormat = colon > 0 && colon < firstLegacy && /^[^\s@]+@[^\s@]+$/u.test(emailCandidate);
+  let sep = colonFormat ? ":" : (value.includes("----") ? "----" : (value.includes("|") ? "|" : null));
+  let parts;
+  if (sep === ":") {
+    // 密码取第一个冒号后的全部内容，因此密码自身可以包含任意后续冒号或旧分隔符。
+    parts = [value.slice(0, colon).trim(), value.slice(colon + 1).trim()];
+  } else if (sep) {
+    parts = value.split(sep).map((p) => p.trim());
+  }
+  if (!sep || !parts) throw new Error(`无法识别的格式：${value}`);
   if (parts.length < 2 || !parts[0] || !parts[1]) {
     throw new Error(`格式错误（至少需要 邮箱${sep}密码）：${value}`);
   }
-  const out = { email: parts[0], password: parts[1], totpSecret: "", recoveryEmail: "", year: "", country: "", raw: value };
+  const out = { email: normalizeEmail(parts[0]), password: parts[1], totpSecret: "", recoveryEmail: "", year: "", country: "", raw: value };
   for (let i = 2; i < parts.length; i += 1) {
     const seg = parts[i];
     if (!seg || seg === "空" || seg === "?") continue;
+    if (i === parts.length - 1 && out.recoveryEmail && /^FA$/i.test(seg)) continue;
     if (!out.totpSecret && totp.looksLikeSecret(seg) && !seg.includes("@")) {
       out.totpSecret = seg.replace(/[\s-]/g, "");
     } else if (!out.recoveryEmail && seg.includes("@")) {
-      out.recoveryEmail = seg;
+      out.recoveryEmail = normalizeEmail(seg);
     } else if (!out.year && /^(19|20)\d{2}$/.test(seg)) {
       out.year = seg;
     } else if (!out.country && /^[A-Za-z]{2,}$/.test(seg) && seg.length <= 24) {
@@ -147,6 +168,11 @@ function createFrom(parsed) {
     lastLoginCheck: null,
     // “仅检测账号密码”的独立结果；不等同于完整登录成功，避免影响账号分类。
     lastPasswordCheck: null,
+    // Cloud 电话验证页的本次信号，不代表账号历史上是否绑定过初始手机号。
+    lastCloudPhoneCheck: null,
+    // 添加身份验证器的结果与未确认密钥分开保存；pending 密钥不能用于登录/取码。
+    lastTotpSetup: null,
+    pendingTotpSetup: null,
     // 分类「库」：默认未分类，需点「一键分类」按规则算出。
     category: "none",
     // 销售状态：默认在库（可售）；出库交付后置 sold 并记 soldAt，避免重复卖。
@@ -369,6 +395,57 @@ function normalizeLoginCheck(value, kind) {
   return normalized;
 }
 
+function normalizeCloudPhoneCheck(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const states = ["new_number_allowed", "existing_phone_required", "unknown"];
+  const state = states.includes(value.state) ? value.state : "unknown";
+  const rawReason = String(value.reasonCode || "");
+  const reasonCode = /^[a-z][a-z0-9_]{0,63}$/.test(rawReason) ? rawReason : "other";
+  const checkedAt = new Date(value.checkedAt || "");
+  // 仅保存简短页面结论；不保留查询令牌或识别出的完整手机号。
+  const detail = String(value.detail || "")
+    .replace(/https?:\/\/[^\s，；]+/gi, (raw) => raw.split(/[?#]/)[0].slice(0, 180))
+    .replace(/\+?\d(?:[\s().-]*\d){6,}/g, (raw) => `••••${raw.replace(/\D/g, "").slice(-4)}`)
+    .slice(0, 500);
+  return {
+    state, reasonCode, detail,
+    checkedAt: Number.isNaN(checkedAt.getTime()) ? nowIso() : checkedAt.toISOString(),
+  };
+}
+
+function normalizeTotpSecret(value) {
+  if (typeof value !== "string") return "";
+  const clean = value.toUpperCase().replace(/[\s-]/g, "").replace(/=+$/, "");
+  return clean.length <= 256 && totp.looksLikeSecret(clean) ? clean : "";
+}
+
+function normalizeTotpSetup(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const states = ["added", "already_configured", "needs_attention", "failed", "pending_activation"];
+  const state = states.includes(value.state) ? value.state : "failed";
+  const checkedAt = new Date(value.checkedAt || "");
+  const detail = String(value.detail || "")
+    .replace(/otpauth:\/\/[^\s，；]+/gi, "[已隐藏密钥]")
+    .replace(/https?:\/\/[^\s，；]+/gi, (raw) => raw.split(/[?#]/)[0].slice(0, 180))
+    .replace(/\b[A-Z2-7]{16,}\b/gi, "[已隐藏密钥]")
+    .slice(0, 500);
+  return {
+    state, detail,
+    checkedAt: Number.isNaN(checkedAt.getTime()) ? nowIso() : checkedAt.toISOString(),
+  };
+}
+
+function normalizePendingTotpSetup(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const secret = normalizeTotpSecret(value.secret);
+  if (!secret || !["prepared", "submitted"].includes(value.stage)) return null;
+  const createdAt = new Date(value.createdAt || "");
+  return {
+    secret, stage: value.stage,
+    createdAt: Number.isNaN(createdAt.getTime()) ? nowIso() : createdAt.toISOString(),
+  };
+}
+
 /**
  * 导入多行，按 email 去重；已存在的只补全空字段，不覆盖。
  * opts.source：本批货源渠道/标签——写到所有「新导入」账号上；
@@ -432,6 +509,9 @@ function update(id, patch) {
   const passwordChanged = passwordTouched
     && String(patch.password == null ? "" : patch.password) !== String(account.password == null ? "" : account.password);
   const passwordCheckProvided = !!(patch && Object.prototype.hasOwnProperty.call(patch, "lastPasswordCheck"));
+  const totpChanged = !!(patch && Object.prototype.hasOwnProperty.call(patch, "totpSecret"))
+    && String(patch.totpSecret == null ? "" : patch.totpSecret) !== String(account.totpSecret || "");
+  const totpSetupProvided = !!(patch && Object.prototype.hasOwnProperty.call(patch, "lastTotpSetup"));
   for (const [key, value] of Object.entries(patch || {})) {
     if (EDITABLE.has(key)) {
       account[key] = String(value == null ? "" : value);
@@ -453,10 +533,20 @@ function update(id, patch) {
       account.lastLoginCheck = normalizeLoginCheck(value, "login");
     } else if (key === "lastPasswordCheck") {
       account.lastPasswordCheck = normalizeLoginCheck(value, "password");
+    } else if (key === "lastCloudPhoneCheck") {
+      account.lastCloudPhoneCheck = normalizeCloudPhoneCheck(value);
+      if (account.lastCloudPhoneCheck) account.lastCheckedAt = nowIso();
+    } else if (key === "lastTotpSetup") {
+      account.lastTotpSetup = normalizeTotpSetup(value);
+      if (account.lastTotpSetup) account.lastCheckedAt = nowIso();
+    } else if (key === "pendingTotpSetup") {
+      account.pendingTotpSetup = normalizePendingTotpSetup(value);
     }
   }
   // 手工只改登录下拉时，旧诊断已不再可信；登录动作会在同一个 patch 里同时提供新的 lastLoginCheck。
   if (loginStatusTouched && !loginCheckProvided) account.lastLoginCheck = null;
+  // 手工替换密钥后，旧的添加结果不再对应当前凭据；动作提交已确认密钥时会同时提供阶段记录。
+  if (totpChanged && !totpSetupProvided) account.lastTotpSetup = null;
   // 密码内容发生变化后，所有基于旧凭据得出的结论都立即失效。
   if (passwordChanged) {
     account.lastPasswordCheck = null;
@@ -493,6 +583,9 @@ function resetStatus(ids) {
     account.status = blankStatus();
     account.lastLoginCheck = null;
     account.lastPasswordCheck = null;
+    account.lastCloudPhoneCheck = null;
+    // 待开启属于未结束的安全设置阶段，清掉会使后续重试误认为“已有密钥，无需处理”。
+    if (account.lastTotpSetup?.state !== "pending_activation") account.lastTotpSetup = null;
     // category 是由检测状态算出来的派生值；全部复原为 unknown 后应回到「未检测」。
     account.category = "unchecked";
     account.lastCheckedAt = "";
@@ -575,6 +668,19 @@ function migrateSaleFields() {
       const normalized = normalizeLoginCheck(account.lastPasswordCheck, "password");
       if (JSON.stringify(normalized) !== JSON.stringify(account.lastPasswordCheck)) {
         account.lastPasswordCheck = normalized;
+        changed = true;
+      }
+    }
+    const cloudPhoneCheck = normalizeCloudPhoneCheck(account.lastCloudPhoneCheck);
+    if (!Object.prototype.hasOwnProperty.call(account, "lastCloudPhoneCheck")
+        || JSON.stringify(cloudPhoneCheck) !== JSON.stringify(account.lastCloudPhoneCheck)) {
+      account.lastCloudPhoneCheck = cloudPhoneCheck;
+      changed = true;
+    }
+    for (const [field, normalize] of [["lastTotpSetup", normalizeTotpSetup], ["pendingTotpSetup", normalizePendingTotpSetup]]) {
+      const normalized = normalize(account[field]);
+      if (!Object.prototype.hasOwnProperty.call(account, field) || JSON.stringify(normalized) !== JSON.stringify(account[field])) {
+        account[field] = normalized;
         changed = true;
       }
     }
@@ -837,6 +943,10 @@ module.exports = {
   getById,
   importText,
   update,
+  normalizeCloudPhoneCheck,
+  normalizeTotpSetup,
+  normalizePendingTotpSetup,
+  normalizeTotpSecret,
   resetStatus,
   remove,
   currentTotp,
